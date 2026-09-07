@@ -5,293 +5,161 @@ from io import BytesIO
 
 import yfinance as yf
 import matplotlib.pyplot as plt
-from flask import Flask
+from flask import Flask, jsonify, render_template_string
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # =========================
 # RYU V2 CONFIG
 # =========================
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-
-if not TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN environment variable is missing.")
-
-# =========================
-# RENDER HEALTH SERVER
-# =========================
+TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
 
 app = Flask(__name__)
 
-
-@app.route("/")
-def home():
-    return "RYU V2 is online."
-
-
-@app.route("/health")
-def health():
-    return "OK"
-
-
-def run_server():
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
-
-
 # =========================
-# MARKET SYMBOLS
+# DASHBOARD
 # =========================
 
-SYMBOLS = {
-    "BTC": "BTC-USD",
-    "ETH": "ETH-USD",
-    "DOGE": "DOGE-USD",
-    "SOL": "SOL-USD",
-    "XRP": "XRP-USD",
+DASHBOARD = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RYU V2</title>
 
-    "AAPL": "AAPL",
-    "TSLA": "TSLA",
-    "NVDA": "NVDA",
-    "MSFT": "MSFT",
-    "AMZN": "AMZN",
-    "META": "META",
-    "GOOGL": "GOOGL",
+<style>
+* { box-sizing:border-box; }
 
-    "EURUSD": "EURUSD=X",
-    "GBPUSD": "GBPUSD=X",
-    "USDJPY": "JPY=X",
-    "AUDUSD": "AUDUSD=X",
-    "USDCAD": "CAD=X",
+body {
+    margin:0;
+    background:#070b12;
+    color:#fff;
+    font-family:Arial,Helvetica,sans-serif;
 }
 
+.header {
+    padding:18px;
+    background:#0d131f;
+    border-bottom:1px solid #202938;
+    position:sticky;
+    top:0;
+    z-index:5;
+}
 
-def get_symbol(text):
-    text = text.upper().strip()
+.brand {
+    font-size:28px;
+    font-weight:800;
+}
 
-    if text in SYMBOLS:
-        return SYMBOLS[text]
+.status {
+    color:#28d17c;
+    font-size:12px;
+    margin-top:5px;
+}
 
-    return text
+.nav {
+    display:flex;
+    gap:8px;
+    padding:12px;
+    background:#0a0f18;
+    overflow-x:auto;
+}
 
+.nav button,
+.filter button {
+    border:1px solid #293346;
+    background:#151c29;
+    color:#cbd3df;
+    padding:10px 15px;
+    border-radius:9px;
+    white-space:nowrap;
+}
 
-# =========================
-# PRICE DATA
-# =========================
+.nav button:first-child {
+    background:#273247;
+    color:white;
+}
 
-def get_price(symbol):
-    ticker = yf.Ticker(symbol)
+.container {
+    max-width:1000px;
+    margin:auto;
+    padding:15px;
+}
 
-    data = ticker.history(
-        period="1d",
-        interval="5m",
-        auto_adjust=False
-    )
+.filters {
+    display:flex;
+    gap:8px;
+    overflow-x:auto;
+    margin-bottom:15px;
+}
 
-    if data.empty:
-        return None
+.card {
+    background:#101722;
+    border:1px solid #222c3d;
+    border-radius:16px;
+    padding:18px;
+    margin-bottom:15px;
+}
 
-    price = float(data["Close"].dropna().iloc[-1])
+.card-title {
+    color:#8793a7;
+    font-size:12px;
+    text-transform:uppercase;
+    letter-spacing:1px;
+}
 
-    return price
+.pair {
+    font-size:25px;
+    font-weight:800;
+    margin-top:5px;
+}
 
+.price {
+    font-size:18px;
+    color:#b7c1cf;
+    margin-top:4px;
+}
 
-# =========================
-# CHART
-# =========================
+.signal-box {
+    text-align:center;
+    padding:22px 10px;
+}
 
-def create_chart(symbol):
-    ticker = yf.Ticker(symbol)
+.signal {
+    font-size:48px;
+    font-weight:900;
+    margin:8px;
+}
 
-    data = ticker.history(
-        period="1d",
-        interval="5m",
-        auto_adjust=False
-    )
+.wait { color:#f4b942; }
+.call { color:#28d17c; }
+.put { color:#ff4d5d; }
 
-    if data.empty:
-        return None
+.confidence {
+    font-size:17px;
+    color:#cbd3df;
+}
 
-    plt.figure(figsize=(10, 5))
+.chart {
+    height:210px;
+    margin-top:15px;
+    background:
+      linear-gradient(#182130 1px, transparent 1px),
+      linear-gradient(90deg,#182130 1px,transparent 1px);
+    background-size:40px 40px;
+    border-radius:10px;
+    position:relative;
+    overflow:hidden;
+}
 
-    plt.plot(
-        data.index,
-        data["Close"],
-        linewidth=2
-    )
-
-    plt.title(f"RYU V2 — {symbol}")
-    plt.xlabel("Time")
-    plt.ylabel("Price")
-    plt.grid(True)
-    plt.xticks(rotation=30)
-    plt.tight_layout()
-
-    image = BytesIO()
-    plt.savefig(image, format="png", dpi=150)
-    plt.close()
-
-    image.seek(0)
-
-    return image
-
-
-# =========================
-# TELEGRAM COMMANDS
-# =========================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = (
-        "🤖 RYU V2 IS ONLINE\n\n"
-        "📊 Markets supported:\n"
-        "• Crypto\n"
-        "• Stocks\n"
-        "• Forex\n\n"
-        "Commands:\n\n"
-        "/price BTC\n"
-        "/price AAPL\n"
-        "/price EURUSD\n\n"
-        "/chart BTC\n"
-        "/chart TSLA\n"
-        "/chart EURUSD\n\n"
-        "Examples:\n"
-        "/price BTC\n"
-        "/chart BTC"
-    )
-
-    await update.message.reply_text(message)
-
-
-async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(
-            "Use:\n/price BTC\n/price AAPL\n/price EURUSD"
-        )
-        return
-
-    requested = context.args[0].upper()
-    symbol = get_symbol(requested)
-
-    try:
-        current = get_price(symbol)
-
-        if current is None:
-            await update.message.reply_text(
-                f"❌ No market data found for {requested}."
-            )
-            return
-
-        await update.message.reply_text(
-            f"📈 RYU V2 PRICE\n\n"
-            f"Asset: {requested}\n"
-            f"Symbol: {symbol}\n"
-            f"Price: {current:,.6f}"
-        )
-
-    except Exception as e:
-        await update.message.reply_text(
-            "❌ Could not retrieve market data."
-        )
-        print("PRICE ERROR:", e)
-
-
-async def chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(
-            "Use:\n/chart BTC\n/chart TSLA\n/chart EURUSD"
-        )
-        return
-
-    requested = context.args[0].upper()
-    symbol = get_symbol(requested)
-
-    await update.message.reply_text(
-        f"📊 Building live chart for {requested}..."
-    )
-
-    try:
-        image = create_chart(symbol)
-
-        if image is None:
-            await update.message.reply_text(
-                f"❌ No chart data found for {requested}."
-            )
-            return
-
-        await update.message.reply_photo(
-            photo=image,
-            caption=f"📊 RYU V2 LIVE MARKET CHART\n{requested}"
-        )
-
-    except Exception as e:
-        await update.message.reply_text(
-            "❌ Chart generation failed."
-        )
-        print("CHART ERROR:", e)
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 RYU V2 COMMANDS\n\n"
-        "/start — Start RYU V2\n"
-        "/price BTC — Current price\n"
-        "/chart BTC — Market chart\n\n"
-        "Stocks:\n"
-        "AAPL, TSLA, NVDA, MSFT, AMZN, META, GOOGL\n\n"
-        "Crypto:\n"
-        "BTC, ETH, DOGE, SOL, XRP\n\n"
-        "Forex:\n"
-        "EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD"
-    )
-
-
-# =========================
-# BOT STARTUP
-# =========================
-
-def start_bot():
-    application = Application.builder().token(TOKEN).build()
-
-    application.add_handler(
-        CommandHandler("start", start)
-    )
-
-    application.add_handler(
-        CommandHandler("price", price)
-    )
-
-    application.add_handler(
-        CommandHandler("chart", chart)
-    )
-
-    application.add_handler(
-        CommandHandler("help", help_command)
-    )
-
-    print("RYU V2 TELEGRAM BOT STARTING...")
-
-    application.run_polling(
-        drop_pending_updates=True
-    )
-
-
-# =========================
-# MAIN
-# =========================
-
-if __name__ == "__main__":
-    server_thread = threading.Thread(
-        target=run_server,
-        daemon=True
-    )
-
-    server_thread.start()
-
-    time.sleep(2)
-
-    start_bot()
+.line {
+    position:absolute;
+    left:0;
+    right:0;
+    top:50%;
+    height:2px;
+    background:#28d17c;
+    transform:rotate(-5deg);
+    box-shadow:
+      70px -18px 0 -0.
