@@ -2,3 +2,4 @@ python-telegram-bot
 yfinance
 matplotlib
 flask
+gunicorn
