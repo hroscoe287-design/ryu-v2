@@ -1,5 +1,6 @@
-flask
+Flask
 gunicorn
 yfinance
 pandas
 numpy
+requests
