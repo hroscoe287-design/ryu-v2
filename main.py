@@ -1,1434 +1,581 @@
 import os
+import json
 import time
-import math
-import requests
 import threading
 from datetime import datetime, timezone
+from collections import deque
 
-import yfinance as yf
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
 
-# ============================================================
-# RYU V2
-# MULTI-MARKET TRADING DASHBOARD
-# FOREX / CRYPTO / STOCKS / OTC
-# ============================================================
+DERIV_WS = os.getenv("DERIV_WS", "wss://ws.derivws.com/websockets/v3")
+DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
+DEFAULT_SYMBOL = os.getenv("DERIV_SYMBOL", "frxEURUSD")
 
-CACHE_SECONDS = 15
-
-cache = {}
-cache_lock = threading.Lock()
-
-
-# ============================================================
-# FOREX
-# ============================================================
-
-FOREX = {
-    "EUR/USD": "EURUSD=X",
-    "GBP/USD": "GBPUSD=X",
-    "USD/JPY": "JPY=X",
-    "USD/CHF": "CHF=X",
-    "AUD/USD": "AUDUSD=X",
-    "USD/CAD": "CAD=X",
-    "NZD/USD": "NZDUSD=X",
-
-    "EUR/GBP": "EURGBP=X",
-    "EUR/JPY": "EURJPY=X",
-    "EUR/CHF": "EURCHF=X",
-    "EUR/AUD": "EURAUD=X",
-    "EUR/CAD": "EURCAD=X",
-    "EUR/NZD": "EURNZD=X",
-
-    "GBP/JPY": "GBPJPY=X",
-    "GBP/CHF": "GBPCHF=X",
-    "GBP/AUD": "GBPAUD=X",
-    "GBP/CAD": "GBPCAD=X",
-    "GBP/NZD": "GBPNZD=X",
-
-    "AUD/JPY": "AUDJPY=X",
-    "AUD/NZD": "AUDNZD=X",
-    "AUD/CAD": "AUDCAD=X",
-    "AUD/CHF": "AUDCHF=X",
-
-    "CAD/JPY": "CADJPY=X",
-    "CAD/CHF": "CADCHF=X",
-
-    "NZD/JPY": "NZDJPY=X",
-    "NZD/CAD": "NZDCAD=X",
-    "NZD/CHF": "NZDCHF=X",
-
-    "USD/SGD": "SGD=X",
-    "USD/HKD": "HKD=X",
-    "USD/CNH": "CNH=X",
-    "USD/SEK": "SEK=X",
-    "USD/NOK": "NOK=X",
-    "USD/DKK": "DKK=X",
-    "USD/PLN": "PLN=X",
-    "USD/MXN": "MXN=X",
-    "USD/ZAR": "ZAR=X",
-    "USD/TRY": "TRY=X",
+SYMBOLS = {
+    "EUR/USD": "frxEURUSD",
+    "GBP/USD": "frxGBPUSD",
+    "USD/JPY": "frxUSDJPY",
+    "AUD/USD": "frxAUDUSD",
+    "USD/CAD": "frxUSDCAD",
+    "EUR/JPY": "frxEURJPY",
+    "BTC/USD": "cryBTCUSD",
+    "ETH/USD": "cryETHUSD",
 }
 
-
-# ============================================================
-# CRYPTO
-# Large practical list + Binance symbols
-# ============================================================
-
-CRYPTO = {
-    "BTC/USD": "BTC-USD",
-    "ETH/USD": "ETH-USD",
-    "BNB/USD": "BNB-USD",
-    "SOL/USD": "SOL-USD",
-    "XRP/USD": "XRP-USD",
-    "ADA/USD": "ADA-USD",
-    "DOGE/USD": "DOGE-USD",
-    "AVAX/USD": "AVAX-USD",
-    "DOT/USD": "DOT-USD",
-    "LINK/USD": "LINK-USD",
-    "MATIC/USD": "MATIC-USD",
-    "LTC/USD": "LTC-USD",
-    "BCH/USD": "BCH-USD",
-    "ATOM/USD": "ATOM-USD",
-    "UNI/USD": "UNI-USD",
-    "ETC/USD": "ETC-USD",
-    "XLM/USD": "XLM-USD",
-    "FIL/USD": "FIL-USD",
-    "HBAR/USD": "HBAR-USD",
-    "APT/USD": "APT-USD",
-    "ARB/USD": "ARB-USD",
-    "OP/USD": "OP-USD",
-    "NEAR/USD": "NEAR-USD",
-    "ALGO/USD": "ALGO-USD",
-    "ICP/USD": "ICP-USD",
-    "VET/USD": "VET-USD",
-    "SAND/USD": "SAND-USD",
-    "MANA/USD": "MANA-USD",
-    "AAVE/USD": "AAVE-USD",
-    "EOS/USD": "EOS-USD",
-    "XTZ/USD": "XTZ-USD",
-    "THETA/USD": "THETA-USD",
-    "PEPE/USD": "PEPE-USD",
-    "SHIB/USD": "SHIB-USD",
+state = {
+    "symbol": DEFAULT_SYMBOL,
+    "label": "EUR/USD",
+    "timeframe": 1,
+    "signal": "WAIT",
+    "confidence": 0,
+    "price": None,
+    "entry": None,
+    "payout": 0,
+    "updated": None,
+    "feed": "Deriv",
+    "feed_status": "connecting",
+    "ticks": 0,
+    "history": [],
 }
 
-
-# ============================================================
-# STOCKS
-# Major US universe
-# ============================================================
-
-STOCKS = {
-    "AAPL": "AAPL",
-    "MSFT": "MSFT",
-    "NVDA": "NVDA",
-    "AMZN": "AMZN",
-    "META": "META",
-    "GOOGL": "GOOGL",
-    "GOOG": "GOOG",
-    "TSLA": "TSLA",
-    "AVGO": "AVGO",
-    "BRK-B": "BRK-B",
-    "JPM": "JPM",
-    "LLY": "LLY",
-    "V": "V",
-    "MA": "MA",
-    "XOM": "XOM",
-    "WMT": "WMT",
-    "COST": "COST",
-    "NFLX": "NFLX",
-    "AMD": "AMD",
-    "INTC": "INTC",
-    "QCOM": "QCOM",
-    "MU": "MU",
-    "ORCL": "ORCL",
-    "CRM": "CRM",
-    "ADBE": "ADBE",
-    "CSCO": "CSCO",
-    "IBM": "IBM",
-    "UBER": "UBER",
-    "ABNB": "ABNB",
-    "DIS": "DIS",
-    "NKE": "NKE",
-    "MCD": "MCD",
-    "KO": "KO",
-    "PEP": "PEP",
-    "BA": "BA",
-    "CAT": "CAT",
-    "GE": "GE",
-    "GM": "GM",
-    "F": "F",
-    "T": "T",
-    "VZ": "VZ",
-    "PYPL": "PYPL",
-    "SQ": "SQ",
-    "SHOP": "SHOP",
-    "PLTR": "PLTR",
-    "COIN": "COIN",
-    "HOOD": "HOOD",
-    "RIVN": "RIVN",
-    "LCID": "LCID",
-}
+ticks = deque(maxlen=3000)
+lock = threading.Lock()
 
 
-# ============================================================
-# OTC
-#
-# IMPORTANT:
-# These are OTC-market securities, NOT Pocket Option's
-# proprietary OTC pricing.
-# ============================================================
-
-OTC = {
-    "Nintendo": "NTDOY",
-    "Tencent": "TCEHY",
-    "Alibaba": "BABA",
-    "Toyota": "TM",
-    "Sony": "SONY",
-    "Volkswagen": "VWAGY",
-    "Shell": "SHEL",
-    "Unilever": "UL",
-    "BP": "BP",
-    "HSBC": "HSBC",
-}
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
 
 
-MARKETS = {
-    "forex": FOREX,
-    "crypto": CRYPTO,
-    "stocks": STOCKS,
-    "otc": OTC,
-}
+def symbol_label(symbol):
+    for label, code in SYMBOLS.items():
+        if code == symbol:
+            return label
+    return symbol
 
-
-TIMEFRAMES = {
-    "1m": {
-        "interval": "1m",
-        "period": "1d",
-    },
-    "2m": {
-        "interval": "2m",
-        "period": "1d",
-    },
-    "3m": {
-        "interval": "2m",
-        "period": "2d",
-    },
-}
-
-
-# ============================================================
-# INDICATORS
-# ============================================================
 
 def ema(values, period):
+    if not values:
+        return None
 
-    if len(values) < period:
-        return values[-1]
+    k = 2 / (period + 1)
+    value = values[0]
 
-    multiplier = 2 / (period + 1)
+    for price in values[1:]:
+        value = price * k + value * (1 - k)
 
-    result = sum(values[:period]) / period
-
-    for value in values[period:]:
-        result = (
-            (value - result) * multiplier
-        ) + result
-
-    return result
+    return value
 
 
 def rsi(values, period=14):
-
     if len(values) < period + 1:
-        return 50
+        return 50.0
 
     gains = []
     losses = []
 
-    for i in range(1, len(values)):
+    for old, new in zip(
+        values[-period - 1:-1],
+        values[-period:]
+    ):
+        change = new - old
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
 
-        change = values[i] - values[i - 1]
+    average_gain = sum(gains) / period
+    average_loss = sum(losses) / period
 
-        if change >= 0:
-            gains.append(change)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(change))
+    if average_loss == 0:
+        return 100.0
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    for i in range(period, len(gains)):
-
-        avg_gain = (
-            ((avg_gain * (period - 1)) + gains[i])
-            / period
-        )
-
-        avg_loss = (
-            ((avg_loss * (period - 1)) + losses[i])
-            / period
-        )
-
-    if avg_loss == 0:
-        return 100
-
-    rs = avg_gain / avg_loss
-
+    rs = average_gain / average_loss
     return 100 - (100 / (1 + rs))
 
 
-def macd(values):
+def make_signal(prices):
+    if len(prices) < 30:
+        return "WAIT", 0, ["Waiting for enough Deriv ticks"]
 
-    if len(values) < 35:
-        return 0, 0, 0
+    fast = ema(prices[-60:], 9)
+    slow = ema(prices[-60:], 21)
+    current_rsi = rsi(prices)
 
-    fast = ema(values, 12)
-    slow = ema(values, 26)
+    recent = prices[-8:]
+    momentum = recent[-1] - recent[0]
 
-    line = fast - slow
-
-    history = []
-
-    for i in range(26, len(values) + 1):
-
-        subset = values[:i]
-
-        history.append(
-            ema(subset, 12)
-            -
-            ema(subset, 26)
-        )
-
-    signal = ema(history, 9)
-
-    histogram = line - signal
-
-    return line, signal, histogram
-
-
-def bollinger(values, period=20):
-
-    if len(values) < period:
-        value = values[-1]
-        return value, value, value
-
-    window = values[-period:]
-
-    middle = sum(window) / period
-
-    variance = sum(
-        (x - middle) ** 2
-        for x in window
-    ) / period
-
-    deviation = math.sqrt(variance)
-
-    return (
-        middle + deviation * 2,
-        middle,
-        middle - deviation * 2,
-    )
-
-
-def atr(highs, lows, closes, period=14):
-
-    if len(closes) < period + 1:
-        return 0
-
-    ranges = []
-
-    for i in range(1, len(closes)):
-
-        ranges.append(
-            max(
-                highs[i] - lows[i],
-                abs(highs[i] - closes[i - 1]),
-                abs(lows[i] - closes[i - 1]),
-            )
-        )
-
-    return sum(ranges[-period:]) / period
-
-
-# ============================================================
-# MARKET DATA
-# ============================================================
-
-def get_data(symbol, timeframe):
-
-    key = symbol + ":" + timeframe
-
-    now = time.time()
-
-    with cache_lock:
-
-        if key in cache:
-
-            item = cache[key]
-
-            if now - item["time"] < CACHE_SECONDS:
-                return item["data"]
-
-    config = TIMEFRAMES[timeframe]
-
-    ticker = yf.Ticker(symbol)
-
-    df = ticker.history(
-        period=config["period"],
-        interval=config["interval"],
-        auto_adjust=False,
-        prepost=False,
-    )
-
-    if df is None or df.empty:
-        raise RuntimeError(
-            "No market data returned."
-        )
-
-    df = df.dropna(
-        subset=[
-            "Open",
-            "High",
-            "Low",
-            "Close",
-        ]
-    )
-
-    if len(df) < 35:
-        raise RuntimeError(
-            "Not enough candles."
-        )
-
-    opens = [
-        float(x)
-        for x in df["Open"].tolist()
-    ]
-
-    highs = [
-        float(x)
-        for x in df["High"].tolist()
-    ]
-
-    lows = [
-        float(x)
-        for x in df["Low"].tolist()
-    ]
-
-    closes = [
-        float(x)
-        for x in df["Close"].tolist()
-    ]
-
-    timestamps = [
-        str(x)
-        for x in df.index.tolist()
-    ]
-
-    data = {
-        "open": opens[-150:],
-        "high": highs[-150:],
-        "low": lows[-150:],
-        "close": closes[-150:],
-        "timestamps": timestamps[-150:],
-    }
-
-    with cache_lock:
-
-        cache[key] = {
-            "time": now,
-            "data": data,
-        }
-
-    return data
-
-
-# ============================================================
-# RYU SIGNAL ENGINE
-# ============================================================
-
-def analyze(data):
-
-    closes = data["close"]
-    highs = data["high"]
-    lows = data["low"]
-
-    price = closes[-1]
-
-    ema9 = ema(closes, 9)
-    ema21 = ema(closes, 21)
-    ema50 = ema(closes, 50)
-
-    rsi_value = rsi(closes)
-
-    macd_line, macd_signal, macd_hist = macd(
-        closes
-    )
-
-    upper, middle, lower = bollinger(
-        closes
-    )
-
-    atr_value = atr(
-        highs,
-        lows,
-        closes
-    )
+    scale = max(abs(recent[0]) * 0.00005, 1e-12)
 
     score = 0
     reasons = []
 
-    # EMA trend
-    if ema9 > ema21:
-
-        score += 2
-
-        reasons.append(
-            "Short-term trend bullish"
-        )
-
-    elif ema9 < ema21:
-
-        score -= 2
-
-        reasons.append(
-            "Short-term trend bearish"
-        )
-
-    # Major trend
-    if ema21 > ema50:
-
-        score += 2
-
-        reasons.append(
-            "Major trend bullish"
-        )
-
-    elif ema21 < ema50:
-
-        score -= 2
-
-        reasons.append(
-            "Major trend bearish"
-        )
-
-    # RSI
-    if 50 <= rsi_value <= 68:
-
+    if fast > slow:
         score += 1
-
-        reasons.append(
-            "RSI supports CALL"
-        )
-
-    elif 32 <= rsi_value < 50:
-
+        reasons.append("EMA 9 above EMA 21")
+    elif fast < slow:
         score -= 1
+        reasons.append("EMA 9 below EMA 21")
 
-        reasons.append(
-            "RSI supports PUT"
-        )
-
-    if rsi_value > 75:
-
-        score -= 1
-
-        reasons.append(
-            "RSI overbought"
-        )
-
-    elif rsi_value < 25:
-
+    if current_rsi >= 55:
         score += 1
-
         reasons.append(
-            "RSI oversold"
+            f"RSI bullish ({current_rsi:.1f})"
         )
-
-    # MACD
-    if macd_hist > 0:
-
-        score += 2
-
-        reasons.append(
-            "MACD bullish momentum"
-        )
-
-    elif macd_hist < 0:
-
-        score -= 2
-
-        reasons.append(
-            "MACD bearish momentum"
-        )
-
-    # Price vs Bollinger midpoint
-    if price > middle:
-
-        score += 1
-
-        reasons.append(
-            "Price above Bollinger midpoint"
-        )
-
-    elif price < middle:
-
+    elif current_rsi <= 45:
         score -= 1
-
         reasons.append(
-            "Price below Bollinger midpoint"
+            f"RSI bearish ({current_rsi:.1f})"
         )
 
-    # Latest candle
-    if closes[-1] > closes[-2]:
-
+    if momentum > scale:
         score += 1
-
-        reasons.append(
-            "Latest candle bullish"
-        )
-
-    elif closes[-1] < closes[-2]:
-
+        reasons.append("Short momentum up")
+    elif momentum < -scale:
         score -= 1
+        reasons.append("Short momentum down")
 
-        reasons.append(
-            "Latest candle bearish"
+    if score >= 2:
+        confidence = min(95, 60 + score * 9)
+        return "CALL", confidence, reasons
+
+    if score <= -2:
+        confidence = min(95, 60 + abs(score) * 9)
+        return "PUT", confidence, reasons
+
+    return "WAIT", 50 + abs(score) * 3, reasons
+
+
+def update_state(price):
+    price = float(price)
+
+    with lock:
+        ticks.append(price)
+
+        state["price"] = price
+        state["updated"] = utc_now()
+        state["ticks"] += 1
+
+        signal, confidence, reasons = make_signal(
+            list(ticks)
         )
 
-    if score >= 5:
+        previous_signal = state["signal"]
 
-        direction = "CALL"
+        state["signal"] = signal
+        state["confidence"] = int(confidence)
 
-    elif score <= -5:
+        if signal != "WAIT":
+            state["entry"] = price
+        else:
+            state["entry"] = None
 
-        direction = "PUT"
+        if signal != previous_signal:
+            state["last_signal"] = utc_now()
 
-    else:
+        state["history"].append({
+            "time": state["updated"],
+            "signal": signal,
+            "confidence": int(confidence),
+            "price": price,
+            "reasons": reasons,
+        })
 
-        direction = "WAIT"
+        state["history"] = state["history"][-100:]
 
-    maximum = 11
 
-    raw_confidence = (
-        abs(score) / maximum
-    )
-
-    confidence = 50 + (
-        raw_confidence * 45
-    )
-
-    if direction == "WAIT":
-        confidence = min(
-            confidence,
-            69
-        )
-
-    confidence = round(
-        max(
-            50,
-            min(
-                95,
-                confidence
+def deriv_loop():
+    try:
+        import websocket
+    except Exception:
+        with lock:
+            state["feed_status"] = (
+                "websocket package missing"
             )
-        )
-    )
+        return
 
-    if confidence >= 85:
-        risk = "LOW"
+    while True:
+        try:
+            url = (
+                f"{DERIV_WS}"
+                f"?app_id={DERIV_APP_ID}"
+            )
 
-    elif confidence >= 75:
-        risk = "MEDIUM"
+            with lock:
+                state["feed_status"] = "connecting"
 
-    else:
-        risk = "HIGH"
+            ws = websocket.create_connection(
+                url,
+                timeout=20
+            )
 
-    if score >= 3:
-        trend = "BULLISH"
+            ws.send(json.dumps({
+                "ticks": state["symbol"],
+                "subscribe": 1
+            }))
 
-    elif score <= -3:
-        trend = "BEARISH"
+            with lock:
+                state["feed_status"] = "live"
 
-    else:
-        trend = "NEUTRAL"
+            while True:
+                raw = ws.recv()
+                message = json.loads(raw)
 
-    return {
+                if "error" in message:
+                    raise RuntimeError(
+                        message["error"].get(
+                            "message",
+                            "Deriv error"
+                        )
+                    )
 
-        "direction": direction,
+                if "tick" in message:
+                    update_state(
+                        message["tick"]["quote"]
+                    )
 
-        "confidence": confidence,
+        except Exception as error:
+            with lock:
+                state["feed_status"] = (
+                    "reconnecting: "
+                    + str(error)[:80]
+                )
 
-        "score": score,
-
-        "max_score": maximum,
-
-        "risk": risk,
-
-        "trend": trend,
-
-        "entry": round(
-            price,
-            8
-        ),
-
-        "rsi": round(
-            rsi_value,
-            2
-        ),
-
-        "ema9": round(
-            ema9,
-            8
-        ),
-
-        "ema21": round(
-            ema21,
-            8
-        ),
-
-        "ema50": round(
-            ema50,
-            8
-        ),
-
-        "macd": round(
-            macd_line,
-            8
-        ),
-
-        "macd_signal": round(
-            macd_signal,
-            8
-        ),
-
-        "macd_histogram": round(
-            macd_hist,
-            8
-        ),
-
-        "bollinger_upper": round(
-            upper,
-            8
-        ),
-
-        "bollinger_middle": round(
-            middle,
-            8
-        ),
-
-        "bollinger_lower": round(
-            lower,
-            8
-        ),
-
-        "atr": round(
-            atr_value,
-            8
-        ),
-
-        "reasons": reasons[:6],
-
-        "generated_at":
-            datetime.now(
-                timezone.utc
-            ).isoformat(),
-    }
+            time.sleep(3)
 
 
-# ============================================================
-# BUILD SIGNAL
-# ============================================================
-
-def build_signal(
-    market,
-    asset,
-    timeframe
-):
-
-    if market not in MARKETS:
-
-        raise ValueError(
-            "Invalid market."
-        )
-
-    if asset not in MARKETS[market]:
-
-        raise ValueError(
-            "Invalid asset."
-        )
-
-    if timeframe not in TIMEFRAMES:
-
-        raise ValueError(
-            "Invalid timeframe."
-        )
-
-    symbol = MARKETS[
-        market
-    ][asset]
-
-    data = get_data(
-        symbol,
-        timeframe
-    )
-
-    result = analyze(data)
-
-    result.update({
-
-        "market": market,
-
-        "asset": asset,
-
-        "symbol": symbol,
-
-        "timeframe": timeframe,
-
-        "chart": {
-
-            "timestamps":
-                data["timestamps"],
-
-            "open":
-                data["open"],
-
-            "high":
-                data["high"],
-
-            "low":
-                data["low"],
-
-            "close":
-                data["close"],
-        },
-    })
-
-    return result
+def change_symbol(symbol):
+    with lock:
+        state["symbol"] = symbol
+        state["label"] = symbol_label(symbol)
+        state["feed_status"] = "reconnecting"
 
 
-# ============================================================
-# API
-# ============================================================
+@app.route("/")
+def home():
+    return render_template_string(HTML)
+
 
 @app.route("/health")
 def health():
-
     return jsonify({
-
-        "status": "online",
-
-        "engine": "RYU V2",
-
-        "markets": [
-            "forex",
-            "crypto",
-            "stocks",
-            "otc",
-        ],
-
-        "time":
-            datetime.now(
-                timezone.utc
-            ).isoformat(),
+        "status": "ok",
+        "service": "RYU V2",
+        "feed": state["feed"],
+        "feed_status": state["feed_status"],
+        "time": utc_now(),
     })
 
 
-@app.route("/api/markets")
-def api_markets():
-
-    return jsonify(MARKETS)
-
-
-@app.route("/api/search")
-def api_search():
-
-    query = (
-        request.args
-        .get("q", "")
-        .strip()
-        .lower()
-    )
-
-    market = (
-        request.args
-        .get("market", "forex")
-        .lower()
-    )
-
-    if market not in MARKETS:
-        return jsonify([])
-
-    results = []
-
-    for name, symbol in MARKETS[
-        market
-    ].items():
-
-        if (
-            query in name.lower()
-            or query in symbol.lower()
-        ):
-
-            results.append({
-
-                "name": name,
-
-                "symbol": symbol,
-            })
-
-    return jsonify(
-        results[:100]
-    )
+@app.route("/api/state")
+def api_state():
+    with lock:
+        return jsonify(state)
 
 
-@app.route("/api/signal")
-def api_signal():
+@app.route("/api/history")
+def api_history():
+    with lock:
+        return jsonify(state["history"])
 
-    market = request.args.get(
-        "market",
-        "forex"
-    )
 
-    asset = request.args.get(
-        "asset",
-        "EUR/USD"
-    )
+@app.route("/api/symbol/<path:name>", methods=["POST"])
+def api_symbol(name):
+    code = SYMBOLS.get(name)
 
-    timeframe = request.args.get(
-        "timeframe",
-        "1m"
-    )
-
-    try:
-
-        result = build_signal(
-            market,
-            asset,
-            timeframe
-        )
-
-        return jsonify(result)
-
-    except Exception as exc:
-
+    if not code:
         return jsonify({
+            "error": "Unsupported symbol"
+        }), 400
 
-            "error": str(exc),
+    change_symbol(code)
 
-            "market": market,
-
-            "asset": asset,
-
-            "timeframe": timeframe,
-
-        }), 503
+    return jsonify({
+        "ok": True,
+        "symbol": code,
+        "label": name,
+    })
 
 
-# ============================================================
-# DASHBOARD
-# ============================================================
-
-HTML = r"""
+HTML = """
 <!DOCTYPE html>
-
 <html>
-
 <head>
-
-<meta charset="UTF-8">
-
-<meta
-name="viewport"
-content="width=device-width,initial-scale=1"
->
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
 
 <title>RYU V2</title>
 
 <style>
 
-*{
-box-sizing:border-box;
+* {
+    box-sizing: border-box;
 }
 
-body{
-margin:0;
-background:#070a10;
-color:#f4f7fb;
-font-family:Arial,Helvetica,sans-serif;
+body {
+    margin: 0;
+    background: #07111f;
+    color: #eaf2ff;
+    font-family: Arial, sans-serif;
 }
 
-.header{
-height:70px;
-display:flex;
-align-items:center;
-justify-content:space-between;
-padding:0 22px;
-background:#0b0f17;
-border-bottom:1px solid #1d2635;
+.app {
+    max-width: 1200px;
+    margin: auto;
+    padding: 18px;
 }
 
-.logo{
-font-size:27px;
-font-weight:900;
-letter-spacing:2px;
+.top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 18px;
 }
 
-.logo span{
-color:#54ddff;
+.brand {
+    font-size: 28px;
+    font-weight: 900;
+    letter-spacing: 2px;
 }
 
-.online{
-color:#58e6a5;
-font-size:12px;
+.sub {
+    color: #8293aa;
+    font-size: 12px;
 }
 
-.dot{
-display:inline-block;
-width:8px;
-height:8px;
-background:#58e6a5;
-border-radius:50%;
-margin-right:6px;
+.status {
+    padding: 8px 12px;
+    border: 1px solid #233650;
+    border-radius: 20px;
+    font-size: 12px;
 }
 
-.layout{
-display:flex;
-min-height:calc(100vh - 70px);
+.nav,
+.filters {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
 }
 
-.sidebar{
-width:210px;
-background:#090d14;
-border-right:1px solid #1d2635;
-padding:20px 13px;
+button {
+    background: #101e31;
+    color: #b9c9dc;
+    border: 1px solid #253b58;
+    padding: 10px 14px;
+    border-radius: 9px;
 }
 
-.nav{
-padding:14px;
-margin-bottom:7px;
-border-radius:9px;
-color:#8994a7;
+button.active {
+    background: #17304d;
+    color: white;
 }
 
-.nav.active,
-.nav:hover{
-background:#151c28;
-color:white;
+.grid {
+    display: grid;
+    grid-template-columns: 1.5fr .8fr;
+    gap: 14px;
 }
 
-.main{
-flex:1;
-padding:22px;
-max-width:1600px;
-margin:auto;
+.card {
+    background: #0b1728;
+    border: 1px solid #1d314b;
+    border-radius: 14px;
+    padding: 16px;
 }
 
-.top{
-display:flex;
-justify-content:space-between;
-align-items:flex-start;
-gap:15px;
-margin-bottom:18px;
+.price {
+    font-size: 34px;
+    font-weight: 800;
+    margin: 8px 0;
 }
 
-h1{
-margin:0;
-font-size:25px;
+.muted {
+    color: #8293aa;
 }
 
-.small{
-font-size:12px;
-color:#7f8a9e;
+.signal {
+    font-size: 52px;
+    font-weight: 950;
+    margin: 10px 0;
 }
 
-.market-tabs{
-display:flex;
-gap:7px;
-flex-wrap:wrap;
+.call {
+    color: #4ee39b;
 }
 
-button{
-border:1px solid #293446;
-background:#111722;
-color:#cbd3df;
-padding:9px 14px;
-border-radius:8px;
-cursor:pointer;
+.put {
+    color: #ff687d;
 }
 
-button.active{
-background:#54ddff;
-color:#061017;
-border-color:#54ddff;
-font-weight:bold;
+.wait {
+    color: #f2c75c;
 }
 
-.selector{
-display:grid;
-grid-template-columns:1fr auto auto;
-gap:8px;
-margin-bottom:16px;
+.conf {
+    font-size: 20px;
 }
 
-input,
-select{
-width:100%;
-background:#0d121b;
-border:1px solid #293446;
-color:white;
-padding:12px;
-border-radius:9px;
-outline:none;
+.meter {
+    height: 8px;
+    background: #1a2940;
+    border-radius: 10px;
+    overflow: hidden;
+    margin: 10px 0 16px;
 }
 
-.asset-list{
-max-height:0;
-overflow:hidden;
-transition:.2s;
+.fill {
+    height: 100%;
+    background: #4ee39b;
+    width: 0%;
 }
 
-.asset-list.open{
-max-height:300px;
-overflow-y:auto;
+.rows {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
 }
 
-.asset-option{
-padding:10px;
-background:#101620;
-border-bottom:1px solid #1d2635;
-cursor:pointer;
+.row {
+    background: #0e1d30;
+    border-radius: 10px;
+    padding: 12px;
 }
 
-.asset-option:hover{
-background:#17202d;
+.v {
+    font-weight: 800;
+    margin-top: 4px;
 }
 
-.grid{
-display:grid;
-grid-template-columns:repeat(4,1fr);
-gap:13px;
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
 }
 
-.card{
-background:#0d121b;
-border:1px solid #1c2635;
-border-radius:13px;
-padding:17px;
+td,
+th {
+    padding: 10px;
+    border-bottom: 1px solid #1c3049;
+    text-align: left;
 }
 
-.label{
-font-size:11px;
-color:#7f8a9e;
-text-transform:uppercase;
-letter-spacing:1px;
+.chart {
+    height: 280px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #53677f;
+    border: 1px dashed #27405d;
+    border-radius: 10px;
+    margin-top: 12px;
 }
 
-.value{
-font-size:26px;
-font-weight:900;
-margin-top:7px;
-}
+@media(max-width:800px) {
 
-.green{
-color:#58e6a5;
-}
+    .grid {
+        grid-template-columns: 1fr;
+    }
 
-.red{
-color:#ff637c;
-}
-
-.blue{
-color:#54ddff;
-}
-
-.signal-grid{
-display:grid;
-grid-template-columns:1.3fr 1fr 1fr 1fr;
-gap:13px;
-margin-top:14px;
-}
-
-.signal-card{
-min-height:235px;
-}
-
-.pair{
-font-size:20px;
-font-weight:900;
-}
-
-.direction{
-font-size:48px;
-font-weight:900;
-margin:17px 0;
-}
-
-.meta{
-display:flex;
-justify-content:space-between;
-padding:10px 0;
-border-bottom:1px solid #1d2635;
-}
-
-.reason{
-margin-top:8px;
-padding:8px;
-background:#111722;
-border-radius:7px;
-font-size:12px;
-color:#abb5c5;
-}
-
-.chart{
-height:370px;
-margin-top:15px;
-}
-
-canvas{
-width:100%;
-height:100%;
-}
-
-table{
-width:100%;
-border-collapse:collapse;
-margin-top:10px;
-}
-
-th,
-td{
-padding:12px 7px;
-border-bottom:1px solid #1d2635;
-text-align:left;
-}
-
-th{
-font-size:10px;
-color:#7f8a9e;
-}
-
-.footer{
-font-size:11px;
-color:#5f6a7c;
-margin-top:16px;
-}
-
-.error{
-color:#ff637c;
-font-size:12px;
-margin-top:8px;
-}
-
-@media(max-width:1050px){
-
-.grid{
-grid-template-columns:repeat(2,1fr);
-}
-
-.signal-grid{
-grid-template-columns:1fr 1fr;
-}
-
-}
-
-@media(max-width:700px){
-
-.sidebar{
-display:none;
-}
-
-.main{
-padding:13px;
-}
-
-.top{
-flex-direction:column;
-}
-
-.selector{
-grid-template-columns:1fr;
-}
-
-.grid{
-grid-template-columns:1fr 1fr;
-}
-
-.signal-grid{
-grid-template-columns:1fr 1fr;
-}
-
+    .signal {
+        font-size: 44px;
+    }
 }
 
 </style>
-
 </head>
 
 <body>
 
-<header class="header">
-
-<div class="logo">
-RYU <span>V2</span>
-</div>
-
-<div class="online">
-<span class="dot"></span>
-<span id="status">ENGINE ONLINE</span>
-</div>
-
-</header>
-
-<div class="layout">
-
-<aside class="sidebar">
-
-<div class="nav active">
-◈ Signals
-</div>
-
-<div class="nav">
-▣ Trades
-</div>
-
-<div class="nav">
-◒ Performance
-</div>
-
-<div class="nav">
-⚙ Settings
-</div>
-
-</aside>
-
-<main class="main">
+<div class="app">
 
 <div class="top">
 
 <div>
+<div class="brand">RYU V2</div>
+<div class="sub">
+LIVE SIGNAL ENGINE • DERIV FEED
+</div>
+</div>
 
-<h1>
-RYU V2 Trading Engine
-</h1>
-
-<div class="small">
-Forex • Crypto • Stocks • OTC
+<div id="status" class="status">
+CONNECTING
 </div>
 
 </div>
 
-<div class="market-tabs">
 
-<button
-class="market active"
-data-market="forex"
->
+<div class="nav">
+
+<button class="active">
+Signals
+</button>
+
+<button>
+Trades
+</button>
+
+<button>
+Performance
+</button>
+
+<button>
+Settings
+</button>
+
+</div>
+
+
+<div class="filters">
+
+<button class="active">
 Forex
 </button>
 
-<button
-class="market"
-data-market="crypto"
->
+<button>
 Crypto
 </button>
 
-<button
-class="market"
-data-market="stocks"
->
+<button>
 Stocks
 </button>
 
-<button
-class="market"
-data-market="otc"
->
-OTC
-</button>
-
-</div>
-
-</div>
-
-
-<div class="selector">
-
-<div>
-
-<input
-id="search"
-placeholder="Search asset..."
-autocomplete="off"
->
-
-<div
-id="assetList"
-class="asset-list"
-></div>
-
-</div>
-
-<select id="asset"></select>
-
-<div style="display:flex;gap:5px">
-
-<button class="tf active"
-data-tf="1m"
->
+<button class="active">
 1m
 </button>
 
-<button class="tf"
-data-tf="2m"
->
+<button>
 2m
 </button>
 
-<button class="tf"
-data-tf="3m"
->
+<button>
 3m
 </button>
 
 </div>
 
-</div>
 
-
-<section class="grid">
+<div class="grid">
 
 <div class="card">
 
-<div class="label">
-Selected Market
+<div class="muted">
+MARKET
 </div>
 
-<div
-class="value blue"
-id="marketValue"
->
-Forex
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="label">
-Asset
-</div>
-
-<div
-class="value"
-id="assetValue"
->
+<h2 id="pair">
 EUR/USD
+</h2>
+
+<div class="price" id="price">
+—
+</div>
+
+<div class="muted">
+Live Deriv quote
+</div>
+
+<div class="chart" id="chart">
+Waiting for live ticks...
 </div>
 
 </div>
@@ -1436,1159 +583,259 @@ EUR/USD
 
 <div class="card">
 
-<div class="label">
-RYU Signal
+<div class="muted">
+CURRENT SIGNAL
 </div>
 
-<div
-class="value blue"
-id="signal"
->
+<div id="signal"
+class="signal wait">
 WAIT
 </div>
 
+<div class="conf">
+Confidence:
+<b id="confidence">
+0%
+</b>
+</div>
+
+<div class="meter">
+<div id="fill"
+class="fill">
+</div>
 </div>
 
 
-<div class="card">
+<div class="rows">
 
-<div class="label">
-Confidence
+<div class="row">
+<div class="muted">
+ENTRY
+</div>
+<div class="v" id="entry">
+—
+</div>
 </div>
 
-<div
-class="value"
-id="confidence"
->
---
+<div class="row">
+<div class="muted">
+PAYOUT
+</div>
+<div class="v" id="payout">
+—
+</div>
+</div>
+
+<div class="row">
+<div class="muted">
+TIMEFRAME
+</div>
+<div class="v">
+1 MIN
+</div>
+</div>
+
+<div class="row">
+<div class="muted">
+FEED
+</div>
+<div class="v" id="feed">
+Deriv
+</div>
 </div>
 
 </div>
-
-</section>
-
-
-<section class="signal-grid">
-
-
-<div class="card signal-card">
-
-<div
-class="pair"
-id="pair"
->
-EUR/USD
-</div>
-
-<div class="small">
-RYU V2 Decision
-</div>
-
-<div
-class="direction blue"
-id="direction"
->
-WAIT
-</div>
-
-<div class="meta">
-
-<span class="small">
-Entry
-</span>
-
-<span id="entry">
---
-</span>
-
-</div>
-
-<div class="meta">
-
-<span class="small">
-Risk
-</span>
-
-<span id="risk">
---
-</span>
 
 </div>
 
 </div>
 
 
-<div class="card signal-card">
+<div class="card"
+style="margin-top:14px">
 
-<div class="label">
-Trend
-</div>
-
-<div
-class="value"
-id="trend"
->
---
-</div>
-
-<div class="meta">
-<span class="small">
-EMA 9
-</span>
-<span id="ema9">
---
-</span>
-</div>
-
-<div class="meta">
-<span class="small">
-EMA 21
-</span>
-<span id="ema21">
---
-</span>
-</div>
-
-<div class="meta">
-<span class="small">
-EMA 50
-</span>
-<span id="ema50">
---
-</span>
-</div>
-
-</div>
-
-
-<div class="card signal-card">
-
-<div class="label">
-Momentum
-</div>
-
-<div
-class="value blue"
-id="rsi"
->
---
-</div>
-
-<div class="small">
-RSI
-</div>
-
-<div class="meta">
-
-<span class="small">
-MACD
-</span>
-
-<span id="macd">
---
-</span>
-
-</div>
-
-<div class="meta">
-
-<span class="small">
-Histogram
-</span>
-
-<span id="hist">
---
-</span>
-
-</div>
-
-</div>
-
-
-<div class="card signal-card">
-
-<div class="label">
-Confluence
-</div>
-
-<div
-class="value"
-id="score"
->
---
-</div>
-
-<div id="reasons">
-</div>
-
-</div>
-
-</section>
-
-
-<div class="card" style="margin-top:14px">
-
-<div style="display:flex;justify-content:space-between">
-
-<div>
-
-<div
-class="pair"
-id="chartTitle"
->
-EUR/USD
-</div>
-
-<div class="small">
-Live market chart
-</div>
-
-</div>
-
-<div class="green">
-● LIVE
-</div>
-
-</div>
-
-<div class="chart">
-
-<canvas id="chart"></canvas>
-
-</div>
-
-<div
-id="error"
-class="error"
->
-</div>
-
-</div>
-
-
-<div class="card" style="margin-top:14px">
-
-<div class="pair">
-RYU V2 Analysis
-</div>
+<h3>
+Recent Signals
+</h3>
 
 <table>
 
 <thead>
 
 <tr>
-
-<th>
-INDICATOR
-</th>
-
-<th>
-VALUE
-</th>
-
-<th>
-READING
-</th>
-
+<th>Time</th>
+<th>Signal</th>
+<th>Confidence</th>
+<th>Price</th>
 </tr>
 
 </thead>
 
-<tbody>
-
-<tr>
-
-<td>
-RSI
-</td>
-
-<td id="tRsi">
---
-</td>
-
-<td id="tRsiRead">
---
-</td>
-
-</tr>
-
-<tr>
-
-<td>
-EMA
-</td>
-
-<td id="tEma">
---
-</td>
-
-<td id="tEmaRead">
---
-</td>
-
-</tr>
-
-<tr>
-
-<td>
-MACD
-</td>
-
-<td id="tMacd">
---
-</td>
-
-<td id="tMacdRead">
---
-</td>
-
-</tr>
-
-<tr>
-
-<td>
-Bollinger
-</td>
-
-<td id="tBb">
---
-</td>
-
-<td id="tBbRead">
---
-</td>
-
-</tr>
-
-<tr>
-
-<td>
-RYU Decision
-</td>
-
-<td id="tDecision">
---
-</td>
-
-<td id="tDecisionRead">
---
-</td>
-
-</tr>
-
+<tbody id="history">
 </tbody>
 
 </table>
 
 </div>
 
-
-<div class="footer">
-
-RYU V2 •
-Market data engine •
-Last update:
-<span id="updated">
---
-</span>
-
-</div>
-
-</main>
-
 </div>
 
 
 <script>
 
-let market = "forex";
-let timeframe = "1m";
-let asset = "EUR/USD";
-let currentData = null;
+async function refresh() {
 
-const assetSelect =
-document.getElementById("asset");
+    try {
 
-const search =
-document.getElementById("search");
+        const response =
+            await fetch("/api/state");
 
-const assetList =
-document.getElementById("assetList");
+        const data =
+            await response.json();
 
+        document.getElementById("pair")
+            .textContent = data.label;
 
-function color(el, value){
+        document.getElementById("price")
+            .textContent =
+            data.price == null
+            ? "—"
+            : Number(data.price).toFixed(5);
 
-el.classList.remove(
-"green",
-"red",
-"blue"
-);
+        const signal =
+            document.getElementById("signal");
 
-if(
-value === "CALL" ||
-value === "BULLISH"
-){
+        signal.textContent =
+            data.signal;
 
-el.classList.add(
-"green"
-);
+        signal.className =
+            "signal " +
+            data.signal.toLowerCase();
 
-}
+        document.getElementById(
+            "confidence"
+        ).textContent =
+            data.confidence + "%";
 
-else if(
-value === "PUT" ||
-value === "BEARISH"
-){
+        document.getElementById(
+            "fill"
+        ).style.width =
+            data.confidence + "%";
 
-el.classList.add(
-"red"
-);
+        document.getElementById(
+            "entry"
+        ).textContent =
+            data.entry == null
+            ? "—"
+            : Number(data.entry).toFixed(5);
 
-}
+        document.getElementById(
+            "payout"
+        ).textContent =
+            data.payout
+            ? data.payout + "%"
+            : "—";
 
-else{
+        document.getElementById(
+            "feed"
+        ).textContent =
+            data.feed +
+            " • " +
+            data.feed_status;
 
-el.classList.add(
-"blue"
-);
+        document.getElementById(
+            "status"
+        ).textContent =
+            data.feed_status.toUpperCase();
 
-}
+        const history =
+            document.getElementById(
+                "history"
+            );
 
-}
+        history.innerHTML =
+            data.history
+            .slice()
+            .reverse()
+            .slice(0, 12)
+            .map(item => {
 
+                return `
+                <tr>
+                    <td>
+                    ${new Date(
+                        item.time
+                    ).toLocaleTimeString()}
+                    </td>
 
-async function loadAssets(){
+                    <td>
+                    <b>
+                    ${item.signal}
+                    </b>
+                    </td>
 
-const response =
-await fetch(
-"/api/markets"
-);
+                    <td>
+                    ${item.confidence}%
+                    </td>
 
-const markets =
-await response.json();
+                    <td>
+                    ${Number(
+                        item.price
+                    ).toFixed(5)}
+                    </td>
+                </tr>
+                `;
 
-const assets =
-Object.keys(
-markets[market]
-);
+            })
+            .join("");
 
-assetSelect.innerHTML = "";
+        document.getElementById(
+            "chart"
+        ).textContent =
+            data.ticks +
+            " live ticks received • last update " +
+            (
+                data.updated
+                ? new Date(
+                    data.updated
+                  ).toLocaleTimeString()
+                : "—"
+            );
 
-assets.forEach(name => {
+    } catch (error) {
 
-const option =
-document.createElement(
-"option"
-);
+        document.getElementById(
+            "status"
+        ).textContent =
+            "OFFLINE";
 
-option.value = name;
-
-option.textContent = name;
-
-assetSelect.appendChild(
-option
-);
-
-});
-
-if(
-assets.includes(asset)
-){
-
-assetSelect.value =
-asset;
-
-}
-
-else{
-
-asset =
-assets[0];
-
-assetSelect.value =
-asset;
-
-}
-
-}
-
-
-function showSearchResults(){
-
-const query =
-search.value
-.toLowerCase()
-.trim();
-
-assetList.innerHTML = "";
-
-if(!query){
-
-assetList.classList.remove(
-"open"
-);
-
-return;
-
-}
-
-const options =
-Array.from(
-assetSelect.options
-);
-
-const matches =
-options.filter(
-option =>
-option.textContent
-.toLowerCase()
-.includes(query)
-);
-
-matches.slice(0,40).forEach(
-option => {
-
-const div =
-document.createElement(
-"div"
-);
-
-div.className =
-"asset-option";
-
-div.textContent =
-option.textContent;
-
-div.onclick = () => {
-
-asset =
-option.value;
-
-assetSelect.value =
-asset;
-
-search.value =
-asset;
-
-assetList.classList.remove(
-"open"
-);
-
-loadSignal();
-
-};
-
-assetList.appendChild(
-div
-);
-
-});
-
-assetList.classList.add(
-"open"
-);
+    }
 
 }
 
+setInterval(refresh, 1000);
 
-async function loadSignal(){
-
-document.getElementById(
-"error"
-).textContent = "";
-
-try{
-
-const response =
-await fetch(
-"/api/signal?market=" +
-encodeURIComponent(market) +
-"&asset=" +
-encodeURIComponent(asset) +
-"&timeframe=" +
-encodeURIComponent(timeframe)
-);
-
-const data =
-await response.json();
-
-if(!response.ok){
-
-throw new Error(
-data.error ||
-"Market data unavailable"
-);
-
-}
-
-currentData = data;
-
-update(data);
-
-}
-
-catch(error){
-
-document.getElementById(
-"error"
-).textContent =
-"Market data error: " +
-error.message;
-
-document.getElementById(
-"status"
-).textContent =
-"DATA RETRYING";
-
-}
-
-}
-
-
-function update(data){
-
-document.getElementById(
-"marketValue"
-).textContent =
-market.toUpperCase();
-
-document.getElementById(
-"assetValue"
-).textContent =
-data.asset;
-
-document.getElementById(
-"pair"
-).textContent =
-data.asset;
-
-document.getElementById(
-"chartTitle"
-).textContent =
-data.asset;
-
-document.getElementById(
-"signal"
-).textContent =
-data.direction;
-
-document.getElementById(
-"confidence"
-).textContent =
-data.confidence + "%";
-
-document.getElementById(
-"direction"
-).textContent =
-data.direction;
-
-document.getElementById(
-"entry"
-).textContent =
-data.entry;
-
-document.getElementById(
-"risk"
-).textContent =
-data.risk;
-
-document.getElementById(
-"trend"
-).textContent =
-data.trend;
-
-document.getElementById(
-"rsi"
-).textContent =
-data.rsi;
-
-document.getElementById(
-"ema9"
-).textContent =
-data.ema9;
-
-document.getElementById(
-"ema21"
-).textContent =
-data.ema21;
-
-document.getElementById(
-"ema50"
-).textContent =
-data.ema50;
-
-document.getElementById(
-"macd"
-).textContent =
-data.macd;
-
-document.getElementById(
-"hist"
-).textContent =
-data.macd_histogram;
-
-document.getElementById(
-"score"
-).textContent =
-Math.abs(data.score)
-+ " / "
-+ data.max_score;
-
-color(
-document.getElementById("signal"),
-data.direction
-);
-
-color(
-document.getElementById("direction"),
-data.direction
-);
-
-color(
-document.getElementById("trend"),
-data.trend
-);
-
-
-const reasons =
-document.getElementById(
-"reasons"
-);
-
-reasons.innerHTML = "";
-
-data.reasons.forEach(
-reason => {
-
-const div =
-document.createElement(
-"div"
-);
-
-div.className =
-"reason";
-
-div.textContent =
-"✓ " + reason;
-
-reasons.appendChild(
-div
-);
-
-});
-
-
-document.getElementById(
-"tRsi"
-).textContent =
-data.rsi;
-
-document.getElementById(
-"tRsiRead"
-).textContent =
-data.rsi > 70
-? "OVERBOUGHT"
-: data.rsi < 30
-? "OVERSOLD"
-: data.rsi >= 50
-? "BULLISH"
-: "BEARISH";
-
-
-document.getElementById(
-"tEma"
-).textContent =
-data.ema9
-+ " / "
-+ data.ema21;
-
-document.getElementById(
-"tEmaRead"
-).textContent =
-data.ema9 > data.ema21
-? "BULLISH"
-: "BEARISH";
-
-
-document.getElementById(
-"tMacd"
-).textContent =
-data.macd;
-
-document.getElementById(
-"tMacdRead"
-).textContent =
-data.macd_histogram > 0
-? "POSITIVE"
-: "NEGATIVE";
-
-
-document.getElementById(
-"tBb"
-).textContent =
-data.bollinger_middle;
-
-document.getElementById(
-"tBbRead"
-).textContent =
-data.entry >
-data.bollinger_middle
-? "ABOVE MIDLINE"
-: "BELOW MIDLINE";
-
-
-document.getElementById(
-"tDecision"
-).textContent =
-data.direction;
-
-document.getElementById(
-"tDecisionRead"
-).textContent =
-data.confidence
-+ "% CONFIDENCE";
-
-
-document.getElementById(
-"updated"
-).textContent =
-new Date().toLocaleTimeString();
-
-document.getElementById(
-"status"
-).textContent =
-"ENGINE ONLINE";
-
-drawChart(
-data.chart
-);
-
-}
-
-
-function drawChart(chart){
-
-const canvas =
-document.getElementById(
-"chart"
-);
-
-const ctx =
-canvas.getContext("2d");
-
-const rect =
-canvas.getBoundingClientRect();
-
-const dpr =
-window.devicePixelRatio || 1;
-
-canvas.width =
-rect.width * dpr;
-
-canvas.height =
-rect.height * dpr;
-
-ctx.setTransform(
-dpr,
-0,
-0,
-dpr,
-0,
-0
-);
-
-const w =
-rect.width;
-
-const h =
-rect.height;
-
-ctx.clearRect(
-0,
-0,
-w,
-h
-);
-
-const prices =
-chart.close;
-
-if(!prices ||
-prices.length < 2){
-
-return;
-
-}
-
-let min =
-Math.min(...prices);
-
-let max =
-Math.max(...prices);
-
-let range =
-max - min;
-
-if(range === 0){
-range = 1;
-}
-
-
-ctx.strokeStyle =
-"#1c2635";
-
-ctx.lineWidth = 1;
-
-
-for(
-let i=1;
-i<6;
-i++
-){
-
-const y =
-(h/6)*i;
-
-ctx.beginPath();
-
-ctx.moveTo(
-0,
-y
-);
-
-ctx.lineTo(
-w,
-y
-);
-
-ctx.stroke();
-
-}
-
-
-ctx.beginPath();
-
-prices.forEach(
-(price,i) => {
-
-const x =
-(i/(prices.length-1))
-* w;
-
-const y =
-h -
-(
-(price-min)
-/
-range
-)
-*
-(h-30)
--15;
-
-if(i===0){
-
-ctx.moveTo(
-x,
-y
-);
-
-}
-
-else{
-
-ctx.lineTo(
-x,
-y
-);
-
-}
-
-});
-
-
-ctx.strokeStyle =
-"#54ddff";
-
-ctx.lineWidth = 2;
-
-ctx.stroke();
-
-
-const last =
-prices[
-prices.length-1
-];
-
-const y =
-h -
-(
-(last-min)
-/
-range
-)
-*
-(h-30)
--15;
-
-
-ctx.beginPath();
-
-ctx.arc(
-w,
-y,
-5,
-0,
-Math.PI*2
-);
-
-ctx.fillStyle =
-"#58e6a5";
-
-ctx.fill();
-
-}
-
-
-document.querySelectorAll(
-".market"
-).forEach(
-button => {
-
-button.onclick =
-async () => {
-
-document.querySelectorAll(
-".market"
-).forEach(
-b =>
-b.classList.remove(
-"active"
-)
-);
-
-button.classList.add(
-"active"
-);
-
-market =
-button.dataset.market;
-
-await loadAssets();
-
-await loadSignal();
-
-};
-
-});
-
-
-document.querySelectorAll(
-".tf"
-).forEach(
-button => {
-
-button.onclick =
-async () => {
-
-document.querySelectorAll(
-".tf"
-).forEach(
-b =>
-b.classList.remove(
-"active"
-)
-);
-
-button.classList.add(
-"active"
-);
-
-timeframe =
-button.dataset.tf;
-
-await loadSignal();
-
-};
-
-});
-
-
-assetSelect.onchange =
-() => {
-
-asset =
-assetSelect.value;
-
-loadSignal();
-
-};
-
-
-search.oninput =
-showSearchResults;
-
-
-window.onresize =
-() => {
-
-if(currentData){
-
-drawChart(
-currentData.chart
-);
-
-}
-
-};
-
-
-async function start(){
-
-await loadAssets();
-
-await loadSignal();
-
-setInterval(
-loadSignal,
-30000
-);
-
-}
-
-
-start();
+refresh();
 
 </script>
 
 </body>
-
 </html>
 """
 
 
-@app.route("/")
-def home():
-    return render_template_string(
-        HTML
-    )
-
-
-# ============================================================
-# START
-# ============================================================
-
 if __name__ == "__main__":
 
+    threading.Thread(
+        target=deriv_loop,
+        daemon=True
+    ).start()
+
     port = int(
-        os.environ.get(
-            "PORT",
-            5000
-        )
+        os.getenv("PORT", "10000")
     )
 
     app.run(
         host="0.0.0.0",
-        port=port,
-        debug=False
+        port=port
 )
