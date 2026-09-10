@@ -1,61 +1,28 @@
 import os
 import math
-import random
 import time
 import threading
-from collections import defaultdict, deque
+from collections import deque
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request, render_template_string
 
+
 # ============================================================
 # RYU V2
-# COMPLETE SIGNAL DASHBOARD
-# ============================================================
-#
-# SIGNAL ONLY.
-# This application does NOT place Pocket Option trades.
-#
-# Render start command:
-#     gunicorn main:app
-#
-# Optional environment variables:
-#     RYU_NAME=RYU V2
-#     RYU_DEMO=true
-#     DEFAULT_PAYOUT=80
-#     SIGNAL_THRESHOLD=68
+# SIMPLE RENDER BUILD
+# SIGNAL DASHBOARD ONLY
 # ============================================================
 
 app = Flask(__name__)
 
-RYU_NAME = os.getenv("RYU_NAME", "RYU V2")
-DEMO_MODE = os.getenv("RYU_DEMO", "true").lower() not in (
-    "false",
-    "0",
-    "no",
-)
+PORT = int(os.environ.get("PORT", "10000"))
 
-DEFAULT_PAYOUT = float(os.getenv("DEFAULT_PAYOUT", "80"))
-SIGNAL_THRESHOLD = float(os.getenv("SIGNAL_THRESHOLD", "68"))
+# Test expiry requested for Ryu V2.
+EXPIRY_MINUTES = 5
 
-lock = threading.Lock()
-
-market_data = defaultdict(lambda: deque(maxlen=240))
-latest_signal = {}
-trade_log = deque(maxlen=200)
-
-feed_status = {
-    "connected": False,
-    "last_update": None,
-    "source": "RYU Demo Market Engine" if DEMO_MODE else "Waiting for feed",
-}
-
-
-# ============================================================
-# ASSETS
-# ============================================================
-
-ASSETS = {
+# Supported display markets.
+MARKETS = {
     "Forex": [
         "EUR/USD OTC",
         "GBP/USD OTC",
@@ -63,7 +30,6 @@ ASSETS = {
         "AUD/USD OTC",
         "USD/CAD OTC",
         "USD/CHF OTC",
-        "EUR/GBP OTC",
     ],
     "Crypto": [
         "BTC/USD OTC",
@@ -81,486 +47,451 @@ ASSETS = {
     ],
 }
 
+# In-memory candle storage.
+# A real connector can POST candles into /api/feed.
+CANDLES = {}
+LOCK = threading.Lock()
+
+MAX_CANDLES = 300
+
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+def now_utc():
+    return datetime.now(timezone.utc)
 
 
-def seed_prices(asset):
-    prices = {
-        "BTC/USD OTC": 65000.0,
-        "ETH/USD OTC": 3200.0,
-        "SOL/USD OTC": 145.0,
-        "XRP/USD OTC": 0.62,
+def iso_now():
+    return now_utc().isoformat()
 
-        "EUR/USD OTC": 1.1050,
-        "GBP/USD OTC": 1.3100,
-        "USD/JPY OTC": 147.5,
-        "AUD/USD OTC": 0.6650,
-        "USD/CAD OTC": 1.3600,
-        "USD/CHF OTC": 0.8850,
-        "EUR/GBP OTC": 0.8440,
 
-        "AAPL OTC": 225.0,
-        "TSLA OTC": 245.0,
-        "NVDA OTC": 180.0,
-        "AMZN OTC": 230.0,
-        "SPY OTC": 650.0,
-        "QQQ OTC": 575.0,
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def safe_float(value, default=None):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def asset_category(asset):
+    for category, assets in MARKETS.items():
+        if asset in assets:
+            return category
+    return "Forex"
+
+
+def ensure_asset(asset):
+    if not asset:
+        asset = MARKETS["Forex"][0]
+
+    for assets in MARKETS.values():
+        if asset in assets:
+            return asset
+
+    return MARKETS["Forex"][0]
+
+
+def get_candles(asset):
+    with LOCK:
+        return list(CANDLES.get(asset, []))
+
+
+def add_candle(asset, candle):
+    required = ["time", "open", "high", "low", "close"]
+
+    for key in required:
+        if key not in candle:
+            return False
+
+    clean = {
+        "time": candle["time"],
+        "open": safe_float(candle["open"]),
+        "high": safe_float(candle["high"]),
+        "low": safe_float(candle["low"]),
+        "close": safe_float(candle["close"]),
     }
 
-    return prices.get(asset, 100.0)
+    if any(clean[k] is None for k in ["open", "high", "low", "close"]):
+        return False
 
+    with LOCK:
+        if asset not in CANDLES:
+            CANDLES[asset] = deque(maxlen=MAX_CANDLES)
 
-def make_demo_candle(asset, previous=None):
-    if previous is None:
-        previous = seed_prices(asset)
+        CANDLES[asset].append(clean)
 
-    volatility = max(previous * 0.0009, 0.00005)
-
-    change = random.gauss(0, volatility)
-
-    close = max(previous + change, 0.00001)
-
-    high = max(previous, close) + abs(
-        random.gauss(0, volatility * 0.55)
-    )
-
-    low = min(previous, close) - abs(
-        random.gauss(0, volatility * 0.55)
-    )
-
-    return {
-        "time": int(time.time()),
-        "open": previous,
-        "high": high,
-        "low": max(low, 0.000001),
-        "close": close,
-    }
+    return True
 
 
 # ============================================================
-# INDICATORS
+# TECHNICAL INDICATORS
 # ============================================================
 
 def sma(values, period):
-    if not values:
-        return 0.0
-
-    sample = values[-period:]
-
-    return sum(sample) / len(sample)
+    if len(values) < period:
+        return None
+    return sum(values[-period:]) / period
 
 
 def ema(values, period):
     if not values:
-        return 0.0
+        return None
+
+    period = max(1, int(period))
+
+    if len(values) < period:
+        return sum(values) / len(values)
 
     multiplier = 2 / (period + 1)
+    result = sum(values[:period]) / period
 
-    result = values[0]
-
-    for value in values[1:]:
-        result = (
-            value * multiplier
-            + result * (1 - multiplier)
-        )
+    for value in values[period:]:
+        result = (value - result) * multiplier + result
 
     return result
 
 
 def rsi(values, period=14):
-    if len(values) < 2:
+    if len(values) < period + 1:
         return 50.0
 
-    changes = [
-        values[i] - values[i - 1]
-        for i in range(1, len(values))
-    ]
+    gains = []
+    losses = []
 
-    recent = changes[-period:]
+    for i in range(len(values) - period, len(values)):
+        change = values[i] - values[i - 1]
 
-    gains = sum(
-        max(change, 0)
-        for change in recent
-    ) / max(len(recent), 1)
+        if change >= 0:
+            gains.append(change)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(change))
 
-    losses = sum(
-        max(-change, 0)
-        for change in recent
-    ) / max(len(recent), 1)
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
 
-    if losses == 0:
+    if avg_loss == 0:
         return 100.0
 
-    relative_strength = gains / losses
-
-    return 100 - (
-        100 / (1 + relative_strength)
-    )
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
 
-def macd_values(values):
+def macd(values):
+    if len(values) < 26:
+        return 0.0, 0.0, 0.0
+
     fast = ema(values, 12)
     slow = ema(values, 26)
 
-    macd = fast - slow
-
-    recent = values[-35:] if len(values) >= 35 else values
-
-    signal = ema(recent, 9)
-
-    return macd, signal
-
-
-def bollinger(values, period=20):
-    if not values:
+    if fast is None or slow is None:
         return 0.0, 0.0, 0.0
 
-    sample = values[-period:]
+    line = fast - slow
 
-    middle = sum(sample) / len(sample)
+    # Approximation for a lightweight engine.
+    signal = ema(values[-9:], 9)
 
-    variance = sum(
-        (value - middle) ** 2
-        for value in sample
-    ) / len(sample)
+    if signal is None:
+        signal = 0.0
 
+    histogram = line - signal
+
+    return line, signal, histogram
+
+
+def bollinger(values, period=20, multiplier=2):
+    if len(values) < period:
+        return None, None, None
+
+    window = values[-period:]
+    middle = sum(window) / period
+
+    variance = sum((x - middle) ** 2 for x in window) / period
     deviation = math.sqrt(variance)
 
-    lower = middle - (2 * deviation)
-    upper = middle + (2 * deviation)
+    upper = middle + multiplier * deviation
+    lower = middle - multiplier * deviation
 
-    return lower, middle, upper
-
-
-def alligator(values):
-    """
-    Lightweight Williams Alligator-style lines.
-
-    Jaw   = 13
-    Teeth = 8
-    Lips  = 5
-    """
-
-    jaw = sma(values, 13)
-    teeth = sma(values, 8)
-    lips = sma(values, 5)
-
-    return jaw, teeth, lips
+    return upper, middle, lower
 
 
 # ============================================================
 # RYU SIGNAL ENGINE
 # ============================================================
 
-def analyze(asset, timeframe):
-    with lock:
-        candles = list(market_data[asset])
+def calculate_signal(asset, timeframe):
+    candles = get_candles(asset)
 
-    closes = [
-        candle["close"]
-        for candle in candles
-    ]
-
-    if len(closes) < 12:
+    if not candles:
         return {
-            "direction": "WAIT",
-            "confidence": 50,
-            "entry": (
-                closes[-1]
-                if closes
-                else seed_prices(asset)
-            ),
-            "reason": "Building market history",
-            "confluence": [
-                "Waiting for more candles"
-            ],
+            "signal": "WAIT",
+            "confidence": 0,
+            "entry": None,
+            "payout": 0,
+            "confluence": ["Waiting for live market feed"],
+            "reason": "No candle data received yet.",
+            "expiry": EXPIRY_MINUTES,
             "timeframe": timeframe,
-            "expiry": "5m",
-            "payout": DEFAULT_PAYOUT,
+            "asset": asset,
+            "generated_at": iso_now(),
         }
 
-    price = closes[-1]
+    closes = [c["close"] for c in candles]
 
-    fast_ma = sma(closes, 5)
-    slow_ma = sma(closes, 20)
+    entry = closes[-1]
 
-    current_rsi = rsi(closes)
+    if len(closes) < 20:
+        return {
+            "signal": "WAIT",
+            "confidence": 0,
+            "entry": entry,
+            "payout": 0,
+            "confluence": [
+                "Collecting candles",
+                "Minimum data not reached",
+            ],
+            "reason": "Ryu is waiting for enough market data.",
+            "expiry": EXPIRY_MINUTES,
+            "timeframe": timeframe,
+            "asset": asset,
+            "generated_at": iso_now(),
+        }
 
-    macd, macd_signal = macd_values(closes)
+    ema9 = ema(closes, 9)
+    ema21 = ema(closes, 21)
+    rsi_value = rsi(closes, 14)
+    macd_line, macd_signal, macd_hist = macd(closes)
 
-    bb_low, bb_mid, bb_high = bollinger(closes)
+    upper, middle, lower = bollinger(closes, 20, 2)
 
-    jaw, teeth, lips = alligator(closes)
+    # Lightweight Alligator-style calculation.
+    jaw = sma(closes, 13)
+    teeth = sma(closes, 8)
+    lips = sma(closes, 5)
 
-    call_score = 0
-    put_score = 0
+    score_call = 0
+    score_put = 0
+    confluence = []
 
-    call_reasons = []
-    put_reasons = []
+    # EMA trend.
+    if ema9 is not None and ema21 is not None:
+        if ema9 > ema21:
+            score_call += 2
+            confluence.append("EMA bullish")
+        elif ema9 < ema21:
+            score_put += 2
+            confluence.append("EMA bearish")
 
-    # --------------------------------------------------------
-    # PRICE / FAST MA
-    # --------------------------------------------------------
+    # Alligator-style alignment.
+    if jaw is not None and teeth is not None and lips is not None:
+        if lips > teeth > jaw:
+            score_call += 2
+            confluence.append("Alligator bullish")
+        elif lips < teeth < jaw:
+            score_put += 2
+            confluence.append("Alligator bearish")
 
-    if price > fast_ma:
-        call_score += 1
-        call_reasons.append(
-            "Price above fast MA"
-        )
-    else:
-        put_score += 1
-        put_reasons.append(
-            "Price below fast MA"
-        )
+    # RSI.
+    if rsi_value >= 55:
+        score_call += 1
+        confluence.append("RSI bullish")
+    elif rsi_value <= 45:
+        score_put += 1
+        confluence.append("RSI bearish")
 
-    # --------------------------------------------------------
-    # MOVING AVERAGE TREND
-    # --------------------------------------------------------
+    # MACD.
+    if macd_hist > 0:
+        score_call += 1
+        confluence.append("MACD bullish")
+    elif macd_hist < 0:
+        score_put += 1
+        confluence.append("MACD bearish")
 
-    if fast_ma > slow_ma:
-        call_score += 1
-        call_reasons.append(
-            "MA trend bullish"
-        )
-    else:
-        put_score += 1
-        put_reasons.append(
-            "MA trend bearish"
-        )
+    # Bollinger position.
+    if upper is not None and lower is not None:
+        if entry > middle:
+            score_call += 1
+            confluence.append("Price above BB midline")
+        elif entry < middle:
+            score_put += 1
+            confluence.append("Price below BB midline")
 
-    # --------------------------------------------------------
-    # MACD
-    # --------------------------------------------------------
+    total = score_call + score_put
 
-    if macd > macd_signal:
-        call_score += 1
-        call_reasons.append(
-            "MACD bullish"
-        )
-    else:
-        put_score += 1
-        put_reasons.append(
-            "MACD bearish"
-        )
-
-    # --------------------------------------------------------
-    # ALLIGATOR
-    # --------------------------------------------------------
-
-    if lips > teeth > jaw:
-        call_score += 2
-        call_reasons.append(
-            "Alligator aligned bullish"
-        )
-
-    elif lips < teeth < jaw:
-        put_score += 2
-        put_reasons.append(
-            "Alligator aligned bearish"
-        )
-
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
-
-    if current_rsi < 35:
-        call_score += 1
-        call_reasons.append(
-            "RSI recovering from low"
-        )
-
-    elif current_rsi > 65:
-        put_score += 1
-        put_reasons.append(
-            "RSI cooling from high"
-        )
-
-    # --------------------------------------------------------
-    # BOLLINGER
-    # --------------------------------------------------------
-
-    if price <= bb_low:
-        call_score += 1
-        call_reasons.append(
-            "Near lower Bollinger band"
-        )
-
-    elif price >= bb_high:
-        put_score += 1
-        put_reasons.append(
-            "Near upper Bollinger band"
-        )
-
-    # --------------------------------------------------------
-    # FINAL DIRECTION
-    # --------------------------------------------------------
-
-    if call_score > put_score:
+    if total == 0:
+        confidence = 0
+        direction = "WAIT"
+    elif score_call >= score_put + 2:
         direction = "CALL"
-        strength = call_score
-        reasons = call_reasons
-
-    elif put_score > call_score:
+        confidence = int(clamp(55 + score_call * 6, 55, 94))
+    elif score_put >= score_call + 2:
         direction = "PUT"
-        strength = put_score
-        reasons = put_reasons
-
+        confidence = int(clamp(55 + score_put * 6, 55, 94))
     else:
         direction = "WAIT"
-        strength = 0
-        reasons = [
-            "Confluence is mixed"
-        ]
+        confidence = int(clamp(50 + abs(score_call - score_put) * 5, 50, 69))
 
-    # --------------------------------------------------------
-    # CONFIDENCE
-    # --------------------------------------------------------
-
-    confidence = min(
-        97,
-        55 + int((strength / 8) * 42)
-    )
-
-    if confidence < SIGNAL_THRESHOLD:
+    # Don't claim a strong setup without enough confirmations.
+    if direction != "WAIT" and confidence < 70:
         direction = "WAIT"
-        reasons = [
-            "Setup below Ryu confidence threshold"
-        ]
+
+    if not confluence:
+        confluence = ["No strong confluence"]
 
     return {
-        "direction": direction,
+        "signal": direction,
         "confidence": confidence,
-        "entry": price,
-        "reason": " • ".join(reasons[:3]),
-        "confluence": reasons[:6],
-
-        "rsi": round(current_rsi, 1),
-
-        "ma_fast": fast_ma,
-        "ma_slow": slow_ma,
-
-        "macd": macd,
-        "macd_signal": macd_signal,
-
-        "bb_low": bb_low,
-        "bb_mid": bb_mid,
-        "bb_high": bb_high,
-
-        "alligator": {
-            "jaw": jaw,
-            "teeth": teeth,
-            "lips": lips,
-        },
-
+        "entry": round(entry, 8),
+        "payout": 0,
+        "confluence": confluence,
+        "reason": (
+            "Bullish confluence detected."
+            if direction == "CALL"
+            else "Bearish confluence detected."
+            if direction == "PUT"
+            else "Ryu is waiting for stronger confirmation."
+        ),
+        "expiry": EXPIRY_MINUTES,
         "timeframe": timeframe,
-
-        # USER REQUESTED EXPIRY
-        "expiry": "5m",
-
-        "payout": DEFAULT_PAYOUT,
+        "asset": asset,
+        "generated_at": iso_now(),
+        "indicators": {
+            "ema9": round(ema9, 8) if ema9 is not None else None,
+            "ema21": round(ema21, 8) if ema21 is not None else None,
+            "rsi": round(rsi_value, 2),
+            "macd": round(macd_line, 8),
+            "macd_signal": round(macd_signal, 8),
+            "macd_histogram": round(macd_hist, 8),
+            "alligator_jaw": round(jaw, 8) if jaw is not None else None,
+            "alligator_teeth": round(teeth, 8) if teeth is not None else None,
+            "alligator_lips": round(lips, 8) if lips is not None else None,
+        },
     }
 
 
 # ============================================================
-# DEMO MARKET ENGINE
+# DEMO DATA
 # ============================================================
 
-def demo_worker():
-    while True:
+def seed_demo_data():
+    """
+    Creates a small synthetic chart so the dashboard is not blank
+    immediately after deployment.
 
-        try:
+    This is NOT Pocket Option data.
+    It is only visual/demo data until /api/feed receives candles.
+    """
 
-            for category in ASSETS.values():
+    base_values = {
+        "EUR/USD OTC": 1.0850,
+        "GBP/USD OTC": 1.2750,
+        "USD/JPY OTC": 147.20,
+        "AUD/USD OTC": 0.6520,
+        "USD/CAD OTC": 1.3600,
+        "USD/CHF OTC": 0.8750,
+        "BTC/USD OTC": 105000.0,
+        "ETH/USD OTC": 3900.0,
+        "SOL/USD OTC": 220.0,
+        "XRP/USD OTC": 2.40,
+        "AAPL OTC": 230.0,
+        "TSLA OTC": 330.0,
+        "NVDA OTC": 175.0,
+        "AMZN OTC": 230.0,
+        "SPY OTC": 650.0,
+        "QQQ OTC": 580.0,
+    }
 
-                for asset in category:
+    for asset, base in base_values.items():
+        value = base
 
-                    with lock:
+        for i in range(60):
+            wave = math.sin(i / 5) * base * 0.0007
+            drift = math.sin(i / 13) * base * 0.00025
 
-                        if market_data[asset]:
+            previous = value
+            close = previous + wave + drift
 
-                            previous = (
-                                market_data[asset][-1]["close"]
-                            )
+            high = max(previous, close) + abs(base) * 0.00025
+            low = min(previous, close) - abs(base) * 0.00025
 
-                        else:
+            add_candle(
+                asset,
+                {
+                    "time": int(time.time()) - (60 - i) * 60,
+                    "open": previous,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                },
+            )
 
-                            previous = seed_prices(asset)
-
-                        candle = make_demo_candle(
-                            asset,
-                            previous
-                        )
-
-                        market_data[asset].append(
-                            candle
-                        )
-
-                        feed_status[
-                            "last_update"
-                        ] = now_iso()
-
-                        feed_status[
-                            "connected"
-                        ] = True
-
-                        feed_status[
-                            "source"
-                        ] = "RYU Demo Market Engine"
-
-                    signal = analyze(
-                        asset,
-                        "1m"
-                    )
-
-                    with lock:
-                        latest_signal[asset] = signal
-
-            time.sleep(2)
-
-        except Exception:
-            time.sleep(2)
+            value = close
 
 
-if DEMO_MODE:
-
-    threading.Thread(
-        target=demo_worker,
-        daemon=True
-    ).start()
+seed_demo_data()
 
 
 # ============================================================
-# ROUTES
+# API ROUTES
 # ============================================================
 
-@app.get("/")
-def index():
-
-    return render_template_string(
-        PAGE,
-        ryu_name=RYU_NAME
-    )
+@app.route("/")
+def home():
+    return render_template_string(HTML)
 
 
-@app.get("/api/health")
+@app.route("/health")
 def health():
-
     return jsonify({
-        "ok": True,
-        "name": RYU_NAME,
-        "demo_mode": DEMO_MODE,
-        "feed": feed_status,
-        "time": now_iso(),
+        "status": "online",
+        "name": "Ryu V2",
+        "signal_only": True,
+        "expiry_minutes": EXPIRY_MINUTES,
+        "time": iso_now(),
     })
 
 
-@app.get("/api/assets")
-def assets():
+@app.route("/api/status")
+def api_status():
+    with LOCK:
+        candle_count = sum(len(v) for v in CANDLES.values())
 
-    return jsonify
+    return jsonify({
+        "status": "online",
+        "name": "Ryu V2",
+        "signal_only": True,
+        "expiry_minutes": EXPIRY_MINUTES,
+        "assets": sum(len(v) for v in MARKETS.values()),
+        "candle_count": candle_count,
+        "time": iso_now(),
+    })
+
+
+@app.route("/api/signal")
+def api_signal():
+    asset = ensure_asset(request.args.get("asset"))
+    timeframe = request.args.get("timeframe", "1m")
+
+    if timeframe not in ("1m", "2m", "3m"):
+        timeframe = "1m"
+
+    result = calculate_signal(asset, timeframe)
+
+    # Demo payout display.
+    # Real payout should be supplied by the live connector.
+    if result["payout"] == 0:
+        result["payout"] = 85
+
+    return jsonify(result)
+
+
+@app.route("/api/chart")
+def api_chart():
+    asset = ensure_asset(request.args.get("
