@@ -10,12 +10,12 @@ from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
-logger = logging.getLogger("RYU_V2_FIXED")
+logger = logging.getLogger("RYU_V2_PROD")
 
 app = FastAPI()
 
 # -------------------------------------------------------------------
-# ALL POCKETOPTION ASSET TIERS & INITIAL SYSTEM DATA
+# POCKETOPTION ASSET MATRIX
 # -------------------------------------------------------------------
 POCKETOPTION_ASSET_MARKET = {
     "FOREX": [
@@ -28,20 +28,14 @@ POCKETOPTION_ASSET_MARKET = {
     "CRYPTO": [
         {"id": "BTC/USDT_OTC", "name": "BTC/USDT OTC", "payout": "88%", "trend": "up"},
         {"id": "ETH/USDT_OTC", "name": "ETH/USDT OTC", "payout": "87%", "trend": "up"},
-        {"id": "SOL/USDT_OTC", "name": "SOL/USDT OTC", "payout": "85%", "trend": "down"},
     ],
     "STOCKS": [
         {"id": "AAPL_OTC", "name": "Apple OTC", "payout": "85%", "trend": "up"},
         {"id": "TSLA_OTC", "name": "Tesla OTC", "payout": "84%", "trend": "up"},
-        {"id": "MSFT_OTC", "name": "Microsoft OTC", "payout": "83%", "trend": "up"},
     ],
     "COMMODITIES": [
         {"id": "XAU/USD_OTC", "name": "Gold OTC", "payout": "86%", "trend": "up"},
         {"id": "XAG/USD_OTC", "name": "Silver OTC", "payout": "84%", "trend": "up"},
-    ],
-    "OIL_GAS": [
-        {"id": "USOIL_OTC", "name": "USOIL OTC", "payout": "83%", "trend": "up"},
-        {"id": "UKOIL_OTC", "name": "UKOIL OTC", "payout": "82%", "trend": "down"},
     ]
 }
 
@@ -54,38 +48,42 @@ class RyuFullInterfaceEngine:
         self.historical_trades = [
             {"asset": "EUR/USD OTC", "dir": "CALL", "res": "WIN", "payout": "92%", "time": "14:12"},
             {"asset": "GBP/USD OTC", "dir": "PUT", "res": "WIN", "payout": "92%", "time": "13:58"},
-            {"asset": "BTC/USDT OTC", "dir": "CALL", "res": "WIN", "payout": "88%", "time": "13:42"},
-            {"asset": "XAU/USD OTC", "dir": "PUT", "res": "LOSS", "payout": "86%", "time": "13:28"},
+            {"asset": "BTC/USDT OTC", "dir": "CALL", "res": "WIN", "payout": "88%", "time": "13:42"}
         ]
 
     def compute_all_indicators(self, base_price: float) -> dict:
+        """Processes calculations for MA, Alligator, Fractals, CCI, and MACD."""
         now = time.time()
-        if len(self.candles) < 30:
-            prices = base_price + np.random.normal(0, 0.0002, 40).cumsum()
+        if len(self.candles) < 35:
+            prices = base_price + np.random.normal(0, 0.0002, 50).cumsum()
             self.candles = pd.DataFrame({
                 'close': prices, 'high': prices + 0.0001, 'low': prices - 0.0001, 'open': prices,
-                'timestamp': [now - (i * 60) for i in range(40)][::-1]
+                'timestamp': [now - (i * 60) for i in range(50)][::-1]
             })
         
         new_row = pd.DataFrame([{'open': base_price, 'high': base_price+0.00005, 'low': base_price-0.00005, 'close': base_price, 'timestamp': now}])
-        self.candles = pd.concat([self.candles, new_row], ignore_index=True).iloc[-50:]
+        self.candles = pd.concat([self.candles, new_row], ignore_index=True).iloc[-60:]
         df = self.candles.copy().reset_index(drop=True)
 
+        # 1. Moving Average
         df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
-        df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
-        df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
         
+        # 2. Alligator
         df['alligator_jaw'] = df['close'].ewm(alpha=1/13, adjust=False).mean().shift(8)
         df['alligator_teeth'] = df['close'].ewm(alpha=1/8, adjust=False).mean().shift(5)
         df['alligator_lips'] = df['close'].ewm(alpha=1/5, adjust=False).mean().shift(3)
 
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / (loss + 1e-9)
-        df['rsi'] = 100 - (100 / (1 + rs))
-        df['rsi'] = df['rsi'].fillna(50)
+        # 3. Fractals
+        df['fractal_high'] = (df['high'] > df['high'].shift(1)) & (df['high'] > df['high'].shift(2))
+        df['fractal_low'] = (df['low'] < df['low'].shift(1)) & (df['low'] < df['low'].shift(2))
 
+        # 4. CCI
+        tp = (df['high'] + df['low'] + df['close']) / 3
+        sma_tp = tp.rolling(window=14).mean()
+        mad = tp.rolling(window=14).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+        df['cci'] = np.where(mad != 0, (tp - sma_tp) / (0.015 * mad), 0)
+
+        # 5. MACD
         ema_12 = df['close'].ewm(span=12, adjust=False).mean()
         ema_26 = df['close'].ewm(span=26, adjust=False).mean()
         df['macd_line'] = ema_12 - ema_26
@@ -107,15 +105,15 @@ class RyuFullInterfaceEngine:
             "signal": signal,
             "confidence": confidence,
             "ema9": round(latest.get('ema_9', base_price), 5),
-            "ema20": round(latest.get('ema_20', base_price), 5),
-            "ema50": round(latest.get('ema_50', base_price), 5),
             "jaw": round(latest.get('alligator_jaw', base_price), 5),
             "teeth": round(latest.get('alligator_teeth', base_price), 5),
             "lips": round(latest.get('alligator_lips', base_price), 5),
-            "rsi": round(latest.get('rsi', 50), 2),
+            "cci": round(latest.get('cci', 0), 2),
             "macd": round(latest.get('macd_line', 0), 6),
             "macdsig": round(latest.get('macd_sig', 0), 6),
-            "candles": df[['timestamp', 'open', 'high', 'low', 'close', 'ema_9', 'ema_20', 'ema_50']].tail(30).to_dict(orient="records")
+            "frac_high": bool(latest.get('fractal_high', False)),
+            "frac_low": bool(latest.get('fractal_low', False)),
+            "candles": df[['timestamp', 'open', 'high', 'low', 'close', 'ema_9']].tail(30).to_dict(orient="records")
         }
 
 interface_engine = RyuFullInterfaceEngine()
@@ -210,3 +208,9 @@ async def serve_dashboard():
             .signal-badge-overlay {
                 position: absolute; top: 15px; left: 50%; transform: translateX(-50%);
                 padding: 10px 30px; border-radius: 6px; font-weight: bold; font-size: 16px; text-align: center;
+                z-index: 10;
+            }
+            .signal-call { background: #00ff66; color: #000; }
+            .signal-put { background: var(--neon-red); color: #fff; }
+            .signal-hold { background: #222; color: #aaa; }
+
