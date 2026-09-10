@@ -10,7 +10,7 @@ from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
-logger = logging.getLogger("RYU_V2_PROD")
+logger = logging.getLogger("RYU_V2_FINAL")
 
 app = FastAPI()
 
@@ -19,23 +19,23 @@ app = FastAPI()
 # -------------------------------------------------------------------
 POCKETOPTION_ASSET_MARKET = {
     "FOREX": [
-        {"id": "EUR/USD_OTC", "name": "EUR/USD OTC", "payout": "92%", "trend": "up"},
-        {"id": "GBP/USD_OTC", "name": "GBP/USD OTC", "payout": "92%", "trend": "up"},
-        {"id": "USD/JPY_OTC", "name": "USD/JPY OTC", "payout": "91%", "trend": "up"},
-        {"id": "AUD/USD_OTC", "name": "AUD/USD OTC", "payout": "91%", "trend": "up"},
-        {"id": "EUR/GBP_OTC", "name": "EUR/GBP OTC", "payout": "88%", "trend": "up"},
+        {"id": "EUR/USD_OTC", "name": "EUR/USD OTC", "payout": "92%"},
+        {"id": "GBP/USD_OTC", "name": "GBP/USD OTC", "payout": "92%"},
+        {"id": "USD/JPY_OTC", "name": "USD/JPY OTC", "payout": "91%"},
+        {"id": "AUD/USD_OTC", "name": "AUD/USD OTC", "payout": "91%"},
+        {"id": "EUR/GBP_OTC", "name": "EUR/GBP OTC", "payout": "88%"}
     ],
     "CRYPTO": [
-        {"id": "BTC/USDT_OTC", "name": "BTC/USDT OTC", "payout": "88%", "trend": "up"},
-        {"id": "ETH/USDT_OTC", "name": "ETH/USDT OTC", "payout": "87%", "trend": "up"},
+        {"id": "BTC/USDT_OTC", "name": "BTC/USDT OTC", "payout": "88%"},
+        {"id": "ETH/USDT_OTC", "name": "ETH/USDT OTC", "payout": "87%"}
     ],
     "STOCKS": [
-        {"id": "AAPL_OTC", "name": "Apple OTC", "payout": "85%", "trend": "up"},
-        {"id": "TSLA_OTC", "name": "Tesla OTC", "payout": "84%", "trend": "up"},
+        {"id": "AAPL_OTC", "name": "Apple OTC", "payout": "85%"},
+        {"id": "TSLA_OTC", "name": "Tesla OTC", "payout": "84%"}
     ],
     "COMMODITIES": [
-        {"id": "XAU/USD_OTC", "name": "Gold OTC", "payout": "86%", "trend": "up"},
-        {"id": "XAG/USD_OTC", "name": "Silver OTC", "payout": "84%", "trend": "up"},
+        {"id": "XAU/USD_OTC", "name": "Gold OTC", "payout": "86%"},
+        {"id": "XAG/USD_OTC", "name": "Silver OTC", "payout": "84%"}
     ]
 }
 
@@ -52,7 +52,6 @@ class RyuFullInterfaceEngine:
         ]
 
     def compute_all_indicators(self, base_price: float) -> dict:
-        """Processes calculations for MA, Alligator, Fractals, CCI, and MACD."""
         now = time.time()
         if len(self.candles) < 35:
             prices = base_price + np.random.normal(0, 0.0002, 50).cumsum()
@@ -65,25 +64,19 @@ class RyuFullInterfaceEngine:
         self.candles = pd.concat([self.candles, new_row], ignore_index=True).iloc[-60:]
         df = self.candles.copy().reset_index(drop=True)
 
-        # 1. Moving Average
+        # Indicators Calculations
         df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
-        
-        # 2. Alligator
-        df['alligator_jaw'] = df['close'].ewm(alpha=1/13, adjust=False).mean().shift(8)
-        df['alligator_teeth'] = df['close'].ewm(alpha=1/8, adjust=False).mean().shift(5)
         df['alligator_lips'] = df['close'].ewm(alpha=1/5, adjust=False).mean().shift(3)
-
-        # 3. Fractals
+        df['alligator_teeth'] = df['close'].ewm(alpha=1/8, adjust=False).mean().shift(5)
+        
         df['fractal_high'] = (df['high'] > df['high'].shift(1)) & (df['high'] > df['high'].shift(2))
         df['fractal_low'] = (df['low'] < df['low'].shift(1)) & (df['low'] < df['low'].shift(2))
 
-        # 4. CCI
         tp = (df['high'] + df['low'] + df['close']) / 3
         sma_tp = tp.rolling(window=14).mean()
         mad = tp.rolling(window=14).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
         df['cci'] = np.where(mad != 0, (tp - sma_tp) / (0.015 * mad), 0)
 
-        # 5. MACD
         ema_12 = df['close'].ewm(span=12, adjust=False).mean()
         ema_26 = df['close'].ewm(span=26, adjust=False).mean()
         df['macd_line'] = ema_12 - ema_26
@@ -105,15 +98,14 @@ class RyuFullInterfaceEngine:
             "signal": signal,
             "confidence": confidence,
             "ema9": round(latest.get('ema_9', base_price), 5),
-            "jaw": round(latest.get('alligator_jaw', base_price), 5),
-            "teeth": round(latest.get('alligator_teeth', base_price), 5),
             "lips": round(latest.get('alligator_lips', base_price), 5),
+            "teeth": round(latest.get('alligator_teeth', base_price), 5),
             "cci": round(latest.get('cci', 0), 2),
             "macd": round(latest.get('macd_line', 0), 6),
             "macdsig": round(latest.get('macd_sig', 0), 6),
             "frac_high": bool(latest.get('fractal_high', False)),
             "frac_low": bool(latest.get('fractal_low', False)),
-            "candles": df[['timestamp', 'open', 'high', 'low', 'close', 'ema_9']].tail(30).to_dict(orient="records")
+            "candles": df[['timestamp', 'open', 'high', 'low', 'close', 'ema_9', 'alligator_lips', 'alligator_teeth']].tail(30).to_dict(orient="records")
         }
 
 interface_engine = RyuFullInterfaceEngine()
@@ -140,7 +132,7 @@ async def po_feed_simulator():
                 except:
                     if ws in interface_engine.active_connections:
                         interface_engine.active_connections.remove(ws)
-        except Exception as e:
+        except Exception:
             await asyncio.sleep(2)
 
 @app.on_event("startup")
@@ -214,3 +206,8 @@ async def serve_dashboard():
             .signal-put { background: var(--neon-red); color: #fff; }
             .signal-hold { background: #222; color: #aaa; }
 
+            .signal-profile-card { text-align: center; padding: 15px; background: #0c1530; border-radius: 6px; border: 1px solid #1c2a59; }
+            .big-call-btn {
+                background: #00e658; color: #000; font-weight: 900; font-size: 22px;
+                border: none; padding: 15px; width: 100%; border-radius: 6px; cursor: pointer; margin-top: 15px;
+            }
