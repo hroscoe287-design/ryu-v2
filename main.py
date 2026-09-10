@@ -64,7 +64,7 @@ class RyuFullInterfaceEngine:
         self.candles = pd.concat([self.candles, new_row], ignore_index=True).iloc[-60:]
         df = self.candles.copy().reset_index(drop=True)
 
-        # Indicators Calculations
+        # Technical Indicators Vector Math
         df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['alligator_lips'] = df['close'].ewm(alpha=1/5, adjust=False).mean().shift(3)
         df['alligator_teeth'] = df['close'].ewm(alpha=1/8, adjust=False).mean().shift(5)
@@ -129,7 +129,7 @@ async def po_feed_simulator():
             for ws in list(interface_engine.active_connections):
                 try:
                     await ws.send_text(json.dumps(payload))
-                except:
+                except Exception:
                     if ws in interface_engine.active_connections:
                         interface_engine.active_connections.remove(ws)
         except Exception:
@@ -150,7 +150,7 @@ async def telemetry_socket(websocket: WebSocket):
             if msg.get("action") == "change_asset":
                 interface_engine.active_asset = msg.get("asset")
                 interface_engine.active_payout = msg.get("payout")
-    except:
+    except Exception:
         if websocket in interface_engine.active_connections:
             interface_engine.active_connections.remove(websocket)
 
