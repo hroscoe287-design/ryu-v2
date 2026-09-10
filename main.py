@@ -1,1400 +1,319 @@
-from flask import Flask, jsonify, request, render_template_string
-import os, time, math
-from datetime import datetime, timezone
-import numpy as np
-import pandas as pd
-import yfinance as yf
+from flask import Flask, jsonify, render_template_string
+import random
+import math
+import time
+from datetime import datetime
 
-app=Flask(__name__)
-APP='Ryu V2'
-EXPIRY=5
-ASSETS={
- 'Forex':{'EUR/USD':'EURUSD=X','GBP/USD':'GBPUSD=X','USD/JPY':'JPY=X','AUD/USD':'AUDUSD=X','USD/CAD':'CAD=X','USD/CHF':'CHF=X','NZD/USD':'NZDUSD=X','EUR/GBP':'EURGBP=X','EUR/JPY':'EURJPY=X'},
- 'Crypto':{'BTC/USDT':'BTC-USD','ETH/USDT':'ETH-USD','SOL/USDT':'SOL-USD','XRP/USDT':'XRP-USD','BNB/USDT':'BNB-USD','DOGE/USDT':'DOGE-USD','ADA/USDT':'ADA-USD','AVAX/USDT':'AVAX-USD','LTC/USDT':'LTC-USD'},
- 'Stocks':{'AAPL':'AAPL','TSLA':'TSLA','NVDA':'NVDA','AMZN':'AMZN','MSFT':'MSFT','META':'META','GOOGL':'GOOGL','NFLX':'NFLX'},
- 'Commodities':{'Gold':'GC=F','Silver':'SI=F','Crude Oil':'CL=F','Natural Gas':'NG=F','Copper':'HG=F'},
- 'ETFs':{'SPY':'SPY','QQQ':'QQQ','IWM':'IWM','DIA':'DIA','GLD':'GLD'}
+app = Flask(__name__)
+
+# ============================================================
+# RYU V2 — FULL VISUAL DASHBOARD
+# ============================================================
+
+HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>RYU V2 — AI Trading Dashboard</title>
+
+<style>
+*{
+    box-sizing:border-box;
+    margin:0;
+    padding:0;
 }
-FRAMES={'1m':('1d','1m'),'2m':('1d','2m'),'3m':('1d','2m'),'5m':('5d','5m'),'10m':('5d','5m'),'15m':('5d','15m'),'30m':('5d','30m'),'1h':('1mo','1h')}
-cache={}
 
-def num(x,n=8):
-    try:
-        x=float(x)
-        return round(x,n) if math.isfinite(x) else None
-    except Exception:
-        return None
+html,body{
+    width:100%;
+    min-height:100%;
+    font-family:Arial,Helvetica,sans-serif;
+    background:#020b07;
+    color:#fff;
+}
 
-def symbol_for(asset):
-    for group in ASSETS.values():
-        if asset in group:return group[asset]
-    return None
+body{
+    overflow-x:hidden;
+}
 
-def getdf(asset,tf):
-    symbol=symbol_for(asset)
-    if not symbol:return pd.DataFrame()
-    tf=tf if tf in FRAMES else '5m';period,interval=FRAMES[tf];key=(symbol,tf);now=time.time()
-    if key in cache and now-cache[key][0]<12:return cache[key][1].copy()
-    try:
-        d=yf.download(symbol,period=period,interval=interval,auto_adjust=False,progress=False,threads=False)
-        if isinstance(d.columns,pd.MultiIndex):d.columns=[c[0] for c in d.columns]
-        d.columns=[str(c).title() for c in d.columns]
-        for c in ['Open','High','Low','Close','Volume']:
-            if c not in d:d[c]=0
-        d=d[['Open','High','Low','Close','Volume']].dropna(subset=['Open','High','Low','Close'])
-        cache[key]=(now,d.copy());return d
-    except Exception:
-        return pd.DataFrame()
+/* ================= BACKGROUND ================= */
 
-def ema(s,n):return s.ewm(span=n,adjust=False).mean()
-def sma(s,n):return s.rolling(n).mean()
-def rsi(s,n=14):
-    d=s.diff();up=d.clip(lower=0);dn=-d.clip(upper=0);a=up.ewm(alpha=1/n,adjust=False).mean();b=dn.ewm(alpha=1/n,adjust=False).mean();return (100-100/(1+a/b.replace(0,np.nan))).fillna(50)
-def atr(d,n=14):
-    p=d.Close.shift();tr=pd.concat([d.High-d.Low,(d.High-p).abs(),(d.Low-p).abs()],axis=1).max(axis=1);return tr.ewm(alpha=1/n,adjust=False).mean()
-def macd(s):
-    m=ema(s,12)-ema(s,26);q=ema(m,9);return m,q,m-q
-def bb(s,n=20):
-    m=sma(s,n);z=s.rolling(n).std();return m,m+2*z,m-2*z
-def stoch(d,n=14):
-    lo=d.Low.rolling(n).min();hi=d.High.rolling(n).max();k=(100*(d.Close-lo)/(hi-lo).replace(0,np.nan)).fillna(50);return k,k.rolling(3).mean().fillna(50)
-def alligator(d):
-    p=(d.High+d.Low)/2;return p.rolling(13).mean().shift(8),p.rolling(8).mean().shift(5),p.rolling(5).mean().shift(3)
-def indicators(d):
-    x=d.copy();x['e9']=ema(x.Close,9);x['e21']=ema(x.Close,21);x['e50']=ema(x.Close,50);x['rsi']=rsi(x.Close);x['atr']=atr(x);x['macd'],x['msig'],x['mh']=macd(x.Close);x['bm'],x['bu'],x['bl']=bb(x.Close);x['sk'],x['sd']=stoch(x);x['jaw'],x['teeth'],x['lips']=alligator(x);return x
+body:before{
+    content:"";
+    position:fixed;
+    inset:0;
+    background:
+        linear-gradient(rgba(0,255,110,.035) 1px,transparent 1px),
+        linear-gradient(90deg,rgba(0,255,110,.035) 1px,transparent 1px);
+    background-size:35px 35px;
+    pointer-events:none;
+    z-index:0;
+}
 
-def signal(d):
-    if len(d)<40:return {'signal':'WAIT','confidence':0,'bull':0,'bear':0,'reason':'Waiting for enough market data','checks':[]}
-    x=indicators(d);r=x.iloc[-1];bull=bear=0;checks=[]
-    def ck(name,side):
-        nonlocal bull,bear
-        if side=='bull':bull+=1
-        elif side=='bear':bear+=1
-        checks.append({'name':name,'value':side.upper(),'ok':side!='neutral'})
-    ck('EMA trend','bull' if r.e9>r.e21 else 'bear' if r.e9<r.e21 else 'neutral')
-    ck('EMA 50','bull' if r.Close>r.e50 else 'bear' if r.Close<r.e50 else 'neutral')
-    ck('RSI','bull' if r.rsi>=52 else 'bear' if r.rsi<=48 else 'neutral')
-    ck('MACD','bull' if r.macd>r.msig else 'bear' if r.macd<r.msig else 'neutral')
-    ck('Alligator','bull' if r.lips>r.teeth>r.jaw else 'bear' if r.lips<r.teeth<r.jaw else 'neutral')
-    ck('Bollinger','bull' if r.Close>r.bm else 'bear' if r.Close<r.bm else 'neutral')
-    ck('Stochastic','bull' if r.sk>r.sd else 'bear' if r.sk<r.sd else 'neutral')
-    ck('Momentum','bull' if r.Close>x.Close.iloc[-2] else 'bear')
-    s='CALL' if bull>=6 and bull>bear else 'PUT' if bear>=6 and bear>bull else 'WAIT'
-    conf=min(97,50+abs(bull-bear)*7)
-    if s=='WAIT':conf=min(conf,59)
-    return {'signal':s,'confidence':int(conf),'bull':bull,'bear':bear,'reason':f'{bull} bullish / {bear} bearish confirmations','checks':checks}
+.glow{
+    position:fixed;
+    width:500px;
+    height:500px;
+    border-radius:50%;
+    background:rgba(0,255,100,.08);
+    filter:blur(90px);
+    left:-180px;
+    top:100px;
+    z-index:0;
+}
 
-def chart_rows(d):
-    if d.empty:return []
-    x=indicators(d).tail(120);out=[]
-    for i,r in x.iterrows():out.append({'time':i.isoformat(),'open':num(r.Open),'high':num(r.High),'low':num(r.Low),'close':num(r.Close),'e9':num(r.e9),'e21':num(r.e21)})
-    return out
+.glow2{
+    position:fixed;
+    width:450px;
+    height:450px;
+    border-radius:50%;
+    background:rgba(0,180,255,.05);
+    filter:blur(100px);
+    right:-180px;
+    bottom:-100px;
+    z-index:0;
+}
 
-@app.get('/')
-def home():return render_template_string(HTML)
-@app.get('/health')
-def health():return jsonify(status='online',app=APP,version='2.0')
-@app.get('/api/assets')
-def assets():return jsonify(ASSETS)
-@app.get('/api/market')
-def market():
-    asset=request.args.get('asset','EUR/USD');tf=request.args.get('timeframe','5m');d=getdf(asset,tf)
-    if d.empty:return jsonify(ok=False,error='Market data unavailable',asset=asset,timeframe=tf)
-    step={'1m':60,'2m':120,'3m':180,'5m':300,'10m':600,'15m':900,'30m':1800,'1h':3600}.get(tf,300)
-    remain=max(0,int(step-time.time()%step));price=num(d.Close.iloc[-1])
-    return jsonify(ok=True,asset=asset,timeframe=tf,expiry_minutes=EXPIRY,price=price,entry=price,signal=signal(d),candle_seconds=remain,chart=chart_rows(d),server_time=datetime.now(timezone.utc).isoformat())
-@app.get('/api/signal')
-def api_signal():return market()
+/* ================= HEADER ================= */
 
-HTML="""<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Ryu V2</title><script src='https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js'></script><style>
-:root{--bg:#070a10;--panel:#101722;--line:#263243;--text:#f4f7fb;--muted:#8996a8;--g:#27e27b;--r:#ff4d5e}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#192434,#070a10 45%);color:var(--text);font:14px Arial,sans-serif}.top{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#070a10ee;z-index:5}.brand{display:flex;align-items:center;gap:10px;font-weight:900;font-size:20px}.logo{width:42px;height:42px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(135deg,#f22,#f90);font-size:22px}.sub{display:block;color:var(--muted);font-size:10px}.live{color:var(--g);font-size:12px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--g);box-shadow:0 0 12px var(--g);margin-right:5px}.nav{display:flex;gap:7px;padding:11px 18px;border-bottom:1px solid var(--line);overflow:auto}.nav button{background:#0d141e;color:var(--muted);border:1px solid var(--line);border-radius:10px;padding:9px 14px}.nav button.active{color:#fff;border-color:#52657f;background:#1a2534}.wrap{max-width:1450px;margin:auto;padding:16px}.toolbar{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}select{width:100%;padding:12px;background:#0c121b;color:#fff;border:1px solid var(--line);border-radius:10px}.grid{display:grid;grid-template-columns:1.65fr .85fr;gap:14px}.card{background:linear-gradient(180deg,#111925,#0d131c);border:1px solid var(--line);border-radius:16px;overflow:hidden}.card h3{margin:0;padding:14px 16px;border-bottom:1px solid var(--line);font-size:13px}.pad{padding:16px}.price{font-size:30px;font-weight:900}.muted{color:var(--muted)}canvas{width:100%!important;height:430px!important}.signal{text-align:center;padding:20px;border:1px solid #735f22;border-radius:16px;background:#28210d}.signal.call{border-color:#23804d;background:#0b291b}.signal.put{border-color:#a73745;background:#300f16}.sigword{font-size:42px;font-weight:1000}.confidence{font-size:18px;font-weight:800;margin-top:4px}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}.metric{padding:10px;border:1px solid var(--line);border-radius:10px;background:#0b1119}.metric b{display:block;margin-top:5px}.checks{display:grid;grid-template-columns:1fr 1fr;gap:7px}.check{padding:9px;border:1px solid var(--line);border-radius:9px;background:#0b1119;font-size:12px}.check.ok{border-color:#275a40}.bull{color:var(--g)}.bear{color:var(--r)}.tab{display:none}.tab.show{display:block}.notice{padding:12px 16px;border-top:1px solid var(--line);font-size:11px;color:var(--muted);line-height:1.5}@media(max-width:900px){.grid{grid-template-columns:1fr}.toolbar{grid-template-columns:1fr 1fr}}@media(max-width:560px){.toolbar{grid-template-columns:1fr}.metrics{grid-template-columns:1fr 1fr}canvas{height:320px!important}}
-</style></head><body><header class='top'><div class='brand'><div class='logo'>🔥</div><div>RYU V2<span class='sub'>AI MARKET SIGNAL DASHBOARD</span></div></div><div class='live'><span class='dot'></span>LIVE</div></header><nav class='nav'><button class='active' data-tab='signals'>Signals</button><button data-tab='trades'>Trades</button><button data-tab='performance'>Performance</button><button data-tab='settings'>Settings</button></nav><main class='wrap'><section id='signals' class='tab show'><div class='toolbar'><select id='market'></select><select id='asset'></select><select id='tf'></select><select><option>5 minute expiry</option></select></div><div class='grid'><section class='card'><h3>LIVE PRICE ACTION</h3><div class='pad'><div class='price' id='price'>--</div><div class='muted' id='label'>Loading...</div><canvas id='chart'></canvas></div><div class='notice'>Ryu V2 provides technical-analysis signals only. It does not place trades. OTC pricing can differ from standard market feeds.</div></section><aside class='card'><h3>RYU SIGNAL ENGINE</h3><div class='pad'><div id='box' class='signal'><div id='signal' class='sigword'>WAIT</div><div id='confidence' class='confidence'>0%</div><div id='reason' class='muted'>Waiting for confirmations</div></div><div class='metrics'><div class='metric'><span class='muted'>Entry</span><b id='entry'>--</b></div><div class='metric'><span class='muted'>Expiry</span><b>5 min</b></div><div class='metric'><span class='muted'>Candle</span><b id='timer'>--</b></div></div><h3 style='padding:18px 0 10px;border:0'>CONFLUENCE</h3><div id='checks' class='checks'></div></div></aside></div></section><section id='trades' class='tab'><div class='card'><h3>TRADES</h3><div class='pad muted'>Demo trade history area. Live execution is disabled.</div></div></section><section id='performance' class='tab'><div class='card'><h3>PERFORMANCE</h3><div class='pad'><div class='metrics'><div class='metric'><span class='muted'>Wins</span><b>0</b></div><div class='metric'><span class='muted'>Losses</span><b>0</b></div><div class='metric'><span class='muted'>Win rate</span><b>0%</b></div></div></div></div></section><section id='settings' class='tab'><div class='card'><h3>SETTINGS</h3><div class='pad'><p><b>Expiry:</b> 5 minutes</p><p><b>Signal frames:</b> 1m, 2m, 3m, 5m, 10m, 15m, 30m, 1h</p><p><b>Indicators:</b> Alligator, EMA, SMA, MACD, RSI, Bollinger Bands, Stochastic, ATR</p></div></div></section></main><script>
-const frames=['1m','2m','3m','5m','10m','15m','30m','1h'];let data={},chart=null,remain=0;const $=x=>document.getElementById(x);
-async function init(){data=await (await fetch('/api/assets')).json();$('market').innerHTML=Object.keys(data).map(x=>`<option>${x}</option>`).join('');$('tf').innerHTML=frames.map(x=>`<option>${x}</option>`).join('');$('tf').value='5m';fill();$('market').onchange=fill;$('asset').onchange=load;$('tf').onchange=load}
-function fill(){$('asset').innerHTML=Object.keys(data[$('market').value]||{}).map(x=>`<option>${x}</option>`).join('');load()}
-async function load(){let a=$('asset').value;if(!a)return;let tf=$('tf').value;try{let d=await (await fetch('/api/market?asset='+encodeURIComponent(a)+'&timeframe='+tf)).json();if(!d.ok){$('reason').textContent=d.error;return}remain=d.candle_seconds;$('price').textContent=d.price??'--';$('entry').textContent=d.entry??'--';$('label').textContent=a+' • '+tf+' • 5 minute expiry';$('signal').textContent=d.signal.signal;$('confidence').textContent=d.signal.confidence+'% confidence';$('reason').textContent=d.signal.reason;$('box').className='signal '+d.signal.signal.toLowerCase();$('checks').innerHTML=d.signal.checks.map(c=>`<div class='check ${c.ok?'ok':''}'><b>${c.name}</b><br><span class='${c.value==='BULL'?'bull':c.value==='BEAR'?'bear':''}'>${c.value}</span></div>`).join('');draw(d.chart)}catch(e){$('reason').textContent='Data connection error'}}
-function draw(r){let labels=r.map(x=>new Date(x.time).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}));if(chart)chart.destroy();chart=new Chart($('chart'),{type:'line',data:{labels,datasets:[{label:'Price',data:r.map(x=>x.close),borderWidth:2,pointRadius:0,tension:.15},{label:'EMA 9',data:r.map(x=>x.e9),borderWidth:1,pointRadius:0},{label:'EMA 21',data:r.map(x=>x.e21),borderWidth:1,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:'#dce3ee'}}},scales:{x:{ticks:{color:'#8996a8',maxTicksLimit:8},grid:{color:'#1b2430'}},y:{ticks:{color:'#8996a8'},grid:{color:'#1b2430'}}}}})}
-setInterval(()=>{remain=Math.max(0,remain-1);$('timer').textContent=String(Math.floor(remain/60)).padStart(2,'0')+':'+String(remain%60).padStart(2,'0')},1000);setInterval(load,15000);document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.nav button').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('show'));b.classList.add('active');$(b.dataset.tab).classList.add('show')});init();
-</script></body></html>"""
+header{
+    position:relative;
+    z-index:5;
+    height:76px;
+    border-bottom:1px solid rgba(0,255,120,.2);
+    background:rgba(2,12,8,.92);
+    backdrop-filter:blur(12px);
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    padding:0 22px;
+}
 
-if __name__=='__main__':
-    app.run(host='0.0.0.0',port=int(os.environ.get('PORT','10000')),debug=False)
-# Ryu V2 build line 122
-# Ryu V2 build line 123
-# Ryu V2 build line 124
-# Ryu V2 build line 125
-# Ryu V2 build line 126
-# Ryu V2 build line 127
-# Ryu V2 build line 128
-# Ryu V2 build line 129
-# Ryu V2 build line 130
-# Ryu V2 build line 131
-# Ryu V2 build line 132
-# Ryu V2 build line 133
-# Ryu V2 build line 134
-# Ryu V2 build line 135
-# Ryu V2 build line 136
-# Ryu V2 build line 137
-# Ryu V2 build line 138
-# Ryu V2 build line 139
-# Ryu V2 build line 140
-# Ryu V2 build line 141
-# Ryu V2 build line 142
-# Ryu V2 build line 143
-# Ryu V2 build line 144
-# Ryu V2 build line 145
-# Ryu V2 build line 146
-# Ryu V2 build line 147
-# Ryu V2 build line 148
-# Ryu V2 build line 149
-# Ryu V2 build line 150
-# Ryu V2 build line 151
-# Ryu V2 build line 152
-# Ryu V2 build line 153
-# Ryu V2 build line 154
-# Ryu V2 build line 155
-# Ryu V2 build line 156
-# Ryu V2 build line 157
-# Ryu V2 build line 158
-# Ryu V2 build line 159
-# Ryu V2 build line 160
-# Ryu V2 build line 161
-# Ryu V2 build line 162
-# Ryu V2 build line 163
-# Ryu V2 build line 164
-# Ryu V2 build line 165
-# Ryu V2 build line 166
-# Ryu V2 build line 167
-# Ryu V2 build line 168
-# Ryu V2 build line 169
-# Ryu V2 build line 170
-# Ryu V2 build line 171
-# Ryu V2 build line 172
-# Ryu V2 build line 173
-# Ryu V2 build line 174
-# Ryu V2 build line 175
-# Ryu V2 build line 176
-# Ryu V2 build line 177
-# Ryu V2 build line 178
-# Ryu V2 build line 179
-# Ryu V2 build line 180
-# Ryu V2 build line 181
-# Ryu V2 build line 182
-# Ryu V2 build line 183
-# Ryu V2 build line 184
-# Ryu V2 build line 185
-# Ryu V2 build line 186
-# Ryu V2 build line 187
-# Ryu V2 build line 188
-# Ryu V2 build line 189
-# Ryu V2 build line 190
-# Ryu V2 build line 191
-# Ryu V2 build line 192
-# Ryu V2 build line 193
-# Ryu V2 build line 194
-# Ryu V2 build line 195
-# Ryu V2 build line 196
-# Ryu V2 build line 197
-# Ryu V2 build line 198
-# Ryu V2 build line 199
-# Ryu V2 build line 200
-# Ryu V2 build line 201
-# Ryu V2 build line 202
-# Ryu V2 build line 203
-# Ryu V2 build line 204
-# Ryu V2 build line 205
-# Ryu V2 build line 206
-# Ryu V2 build line 207
-# Ryu V2 build line 208
-# Ryu V2 build line 209
-# Ryu V2 build line 210
-# Ryu V2 build line 211
-# Ryu V2 build line 212
-# Ryu V2 build line 213
-# Ryu V2 build line 214
-# Ryu V2 build line 215
-# Ryu V2 build line 216
-# Ryu V2 build line 217
-# Ryu V2 build line 218
-# Ryu V2 build line 219
-# Ryu V2 build line 220
-# Ryu V2 build line 221
-# Ryu V2 build line 222
-# Ryu V2 build line 223
-# Ryu V2 build line 224
-# Ryu V2 build line 225
-# Ryu V2 build line 226
-# Ryu V2 build line 227
-# Ryu V2 build line 228
-# Ryu V2 build line 229
-# Ryu V2 build line 230
-# Ryu V2 build line 231
-# Ryu V2 build line 232
-# Ryu V2 build line 233
-# Ryu V2 build line 234
-# Ryu V2 build line 235
-# Ryu V2 build line 236
-# Ryu V2 build line 237
-# Ryu V2 build line 238
-# Ryu V2 build line 239
-# Ryu V2 build line 240
-# Ryu V2 build line 241
-# Ryu V2 build line 242
-# Ryu V2 build line 243
-# Ryu V2 build line 244
-# Ryu V2 build line 245
-# Ryu V2 build line 246
-# Ryu V2 build line 247
-# Ryu V2 build line 248
-# Ryu V2 build line 249
-# Ryu V2 build line 250
-# Ryu V2 build line 251
-# Ryu V2 build line 252
-# Ryu V2 build line 253
-# Ryu V2 build line 254
-# Ryu V2 build line 255
-# Ryu V2 build line 256
-# Ryu V2 build line 257
-# Ryu V2 build line 258
-# Ryu V2 build line 259
-# Ryu V2 build line 260
-# Ryu V2 build line 261
-# Ryu V2 build line 262
-# Ryu V2 build line 263
-# Ryu V2 build line 264
-# Ryu V2 build line 265
-# Ryu V2 build line 266
-# Ryu V2 build line 267
-# Ryu V2 build line 268
-# Ryu V2 build line 269
-# Ryu V2 build line 270
-# Ryu V2 build line 271
-# Ryu V2 build line 272
-# Ryu V2 build line 273
-# Ryu V2 build line 274
-# Ryu V2 build line 275
-# Ryu V2 build line 276
-# Ryu V2 build line 277
-# Ryu V2 build line 278
-# Ryu V2 build line 279
-# Ryu V2 build line 280
-# Ryu V2 build line 281
-# Ryu V2 build line 282
-# Ryu V2 build line 283
-# Ryu V2 build line 284
-# Ryu V2 build line 285
-# Ryu V2 build line 286
-# Ryu V2 build line 287
-# Ryu V2 build line 288
-# Ryu V2 build line 289
-# Ryu V2 build line 290
-# Ryu V2 build line 291
-# Ryu V2 build line 292
-# Ryu V2 build line 293
-# Ryu V2 build line 294
-# Ryu V2 build line 295
-# Ryu V2 build line 296
-# Ryu V2 build line 297
-# Ryu V2 build line 298
-# Ryu V2 build line 299
-# Ryu V2 build line 300
-# Ryu V2 build line 301
-# Ryu V2 build line 302
-# Ryu V2 build line 303
-# Ryu V2 build line 304
-# Ryu V2 build line 305
-# Ryu V2 build line 306
-# Ryu V2 build line 307
-# Ryu V2 build line 308
-# Ryu V2 build line 309
-# Ryu V2 build line 310
-# Ryu V2 build line 311
-# Ryu V2 build line 312
-# Ryu V2 build line 313
-# Ryu V2 build line 314
-# Ryu V2 build line 315
-# Ryu V2 build line 316
-# Ryu V2 build line 317
-# Ryu V2 build line 318
-# Ryu V2 build line 319
-# Ryu V2 build line 320
-# Ryu V2 build line 321
-# Ryu V2 build line 322
-# Ryu V2 build line 323
-# Ryu V2 build line 324
-# Ryu V2 build line 325
-# Ryu V2 build line 326
-# Ryu V2 build line 327
-# Ryu V2 build line 328
-# Ryu V2 build line 329
-# Ryu V2 build line 330
-# Ryu V2 build line 331
-# Ryu V2 build line 332
-# Ryu V2 build line 333
-# Ryu V2 build line 334
-# Ryu V2 build line 335
-# Ryu V2 build line 336
-# Ryu V2 build line 337
-# Ryu V2 build line 338
-# Ryu V2 build line 339
-# Ryu V2 build line 340
-# Ryu V2 build line 341
-# Ryu V2 build line 342
-# Ryu V2 build line 343
-# Ryu V2 build line 344
-# Ryu V2 build line 345
-# Ryu V2 build line 346
-# Ryu V2 build line 347
-# Ryu V2 build line 348
-# Ryu V2 build line 349
-# Ryu V2 build line 350
-# Ryu V2 build line 351
-# Ryu V2 build line 352
-# Ryu V2 build line 353
-# Ryu V2 build line 354
-# Ryu V2 build line 355
-# Ryu V2 build line 356
-# Ryu V2 build line 357
-# Ryu V2 build line 358
-# Ryu V2 build line 359
-# Ryu V2 build line 360
-# Ryu V2 build line 361
-# Ryu V2 build line 362
-# Ryu V2 build line 363
-# Ryu V2 build line 364
-# Ryu V2 build line 365
-# Ryu V2 build line 366
-# Ryu V2 build line 367
-# Ryu V2 build line 368
-# Ryu V2 build line 369
-# Ryu V2 build line 370
-# Ryu V2 build line 371
-# Ryu V2 build line 372
-# Ryu V2 build line 373
-# Ryu V2 build line 374
-# Ryu V2 build line 375
-# Ryu V2 build line 376
-# Ryu V2 build line 377
-# Ryu V2 build line 378
-# Ryu V2 build line 379
-# Ryu V2 build line 380
-# Ryu V2 build line 381
-# Ryu V2 build line 382
-# Ryu V2 build line 383
-# Ryu V2 build line 384
-# Ryu V2 build line 385
-# Ryu V2 build line 386
-# Ryu V2 build line 387
-# Ryu V2 build line 388
-# Ryu V2 build line 389
-# Ryu V2 build line 390
-# Ryu V2 build line 391
-# Ryu V2 build line 392
-# Ryu V2 build line 393
-# Ryu V2 build line 394
-# Ryu V2 build line 395
-# Ryu V2 build line 396
-# Ryu V2 build line 397
-# Ryu V2 build line 398
-# Ryu V2 build line 399
-# Ryu V2 build line 400
-# Ryu V2 build line 401
-# Ryu V2 build line 402
-# Ryu V2 build line 403
-# Ryu V2 build line 404
-# Ryu V2 build line 405
-# Ryu V2 build line 406
-# Ryu V2 build line 407
-# Ryu V2 build line 408
-# Ryu V2 build line 409
-# Ryu V2 build line 410
-# Ryu V2 build line 411
-# Ryu V2 build line 412
-# Ryu V2 build line 413
-# Ryu V2 build line 414
-# Ryu V2 build line 415
-# Ryu V2 build line 416
-# Ryu V2 build line 417
-# Ryu V2 build line 418
-# Ryu V2 build line 419
-# Ryu V2 build line 420
-# Ryu V2 build line 421
-# Ryu V2 build line 422
-# Ryu V2 build line 423
-# Ryu V2 build line 424
-# Ryu V2 build line 425
-# Ryu V2 build line 426
-# Ryu V2 build line 427
-# Ryu V2 build line 428
-# Ryu V2 build line 429
-# Ryu V2 build line 430
-# Ryu V2 build line 431
-# Ryu V2 build line 432
-# Ryu V2 build line 433
-# Ryu V2 build line 434
-# Ryu V2 build line 435
-# Ryu V2 build line 436
-# Ryu V2 build line 437
-# Ryu V2 build line 438
-# Ryu V2 build line 439
-# Ryu V2 build line 440
-# Ryu V2 build line 441
-# Ryu V2 build line 442
-# Ryu V2 build line 443
-# Ryu V2 build line 444
-# Ryu V2 build line 445
-# Ryu V2 build line 446
-# Ryu V2 build line 447
-# Ryu V2 build line 448
-# Ryu V2 build line 449
-# Ryu V2 build line 450
-# Ryu V2 build line 451
-# Ryu V2 build line 452
-# Ryu V2 build line 453
-# Ryu V2 build line 454
-# Ryu V2 build line 455
-# Ryu V2 build line 456
-# Ryu V2 build line 457
-# Ryu V2 build line 458
-# Ryu V2 build line 459
-# Ryu V2 build line 460
-# Ryu V2 build line 461
-# Ryu V2 build line 462
-# Ryu V2 build line 463
-# Ryu V2 build line 464
-# Ryu V2 build line 465
-# Ryu V2 build line 466
-# Ryu V2 build line 467
-# Ryu V2 build line 468
-# Ryu V2 build line 469
-# Ryu V2 build line 470
-# Ryu V2 build line 471
-# Ryu V2 build line 472
-# Ryu V2 build line 473
-# Ryu V2 build line 474
-# Ryu V2 build line 475
-# Ryu V2 build line 476
-# Ryu V2 build line 477
-# Ryu V2 build line 478
-# Ryu V2 build line 479
-# Ryu V2 build line 480
-# Ryu V2 build line 481
-# Ryu V2 build line 482
-# Ryu V2 build line 483
-# Ryu V2 build line 484
-# Ryu V2 build line 485
-# Ryu V2 build line 486
-# Ryu V2 build line 487
-# Ryu V2 build line 488
-# Ryu V2 build line 489
-# Ryu V2 build line 490
-# Ryu V2 build line 491
-# Ryu V2 build line 492
-# Ryu V2 build line 493
-# Ryu V2 build line 494
-# Ryu V2 build line 495
-# Ryu V2 build line 496
-# Ryu V2 build line 497
-# Ryu V2 build line 498
-# Ryu V2 build line 499
-# Ryu V2 build line 500
-# Ryu V2 build line 501
-# Ryu V2 build line 502
-# Ryu V2 build line 503
-# Ryu V2 build line 504
-# Ryu V2 build line 505
-# Ryu V2 build line 506
-# Ryu V2 build line 507
-# Ryu V2 build line 508
-# Ryu V2 build line 509
-# Ryu V2 build line 510
-# Ryu V2 build line 511
-# Ryu V2 build line 512
-# Ryu V2 build line 513
-# Ryu V2 build line 514
-# Ryu V2 build line 515
-# Ryu V2 build line 516
-# Ryu V2 build line 517
-# Ryu V2 build line 518
-# Ryu V2 build line 519
-# Ryu V2 build line 520
-# Ryu V2 build line 521
-# Ryu V2 build line 522
-# Ryu V2 build line 523
-# Ryu V2 build line 524
-# Ryu V2 build line 525
-# Ryu V2 build line 526
-# Ryu V2 build line 527
-# Ryu V2 build line 528
-# Ryu V2 build line 529
-# Ryu V2 build line 530
-# Ryu V2 build line 531
-# Ryu V2 build line 532
-# Ryu V2 build line 533
-# Ryu V2 build line 534
-# Ryu V2 build line 535
-# Ryu V2 build line 536
-# Ryu V2 build line 537
-# Ryu V2 build line 538
-# Ryu V2 build line 539
-# Ryu V2 build line 540
-# Ryu V2 build line 541
-# Ryu V2 build line 542
-# Ryu V2 build line 543
-# Ryu V2 build line 544
-# Ryu V2 build line 545
-# Ryu V2 build line 546
-# Ryu V2 build line 547
-# Ryu V2 build line 548
-# Ryu V2 build line 549
-# Ryu V2 build line 550
-# Ryu V2 build line 551
-# Ryu V2 build line 552
-# Ryu V2 build line 553
-# Ryu V2 build line 554
-# Ryu V2 build line 555
-# Ryu V2 build line 556
-# Ryu V2 build line 557
-# Ryu V2 build line 558
-# Ryu V2 build line 559
-# Ryu V2 build line 560
-# Ryu V2 build line 561
-# Ryu V2 build line 562
-# Ryu V2 build line 563
-# Ryu V2 build line 564
-# Ryu V2 build line 565
-# Ryu V2 build line 566
-# Ryu V2 build line 567
-# Ryu V2 build line 568
-# Ryu V2 build line 569
-# Ryu V2 build line 570
-# Ryu V2 build line 571
-# Ryu V2 build line 572
-# Ryu V2 build line 573
-# Ryu V2 build line 574
-# Ryu V2 build line 575
-# Ryu V2 build line 576
-# Ryu V2 build line 577
-# Ryu V2 build line 578
-# Ryu V2 build line 579
-# Ryu V2 build line 580
-# Ryu V2 build line 581
-# Ryu V2 build line 582
-# Ryu V2 build line 583
-# Ryu V2 build line 584
-# Ryu V2 build line 585
-# Ryu V2 build line 586
-# Ryu V2 build line 587
-# Ryu V2 build line 588
-# Ryu V2 build line 589
-# Ryu V2 build line 590
-# Ryu V2 build line 591
-# Ryu V2 build line 592
-# Ryu V2 build line 593
-# Ryu V2 build line 594
-# Ryu V2 build line 595
-# Ryu V2 build line 596
-# Ryu V2 build line 597
-# Ryu V2 build line 598
-# Ryu V2 build line 599
-# Ryu V2 build line 600
-# Ryu V2 build line 601
-# Ryu V2 build line 602
-# Ryu V2 build line 603
-# Ryu V2 build line 604
-# Ryu V2 build line 605
-# Ryu V2 build line 606
-# Ryu V2 build line 607
-# Ryu V2 build line 608
-# Ryu V2 build line 609
-# Ryu V2 build line 610
-# Ryu V2 build line 611
-# Ryu V2 build line 612
-# Ryu V2 build line 613
-# Ryu V2 build line 614
-# Ryu V2 build line 615
-# Ryu V2 build line 616
-# Ryu V2 build line 617
-# Ryu V2 build line 618
-# Ryu V2 build line 619
-# Ryu V2 build line 620
-# Ryu V2 build line 621
-# Ryu V2 build line 622
-# Ryu V2 build line 623
-# Ryu V2 build line 624
-# Ryu V2 build line 625
-# Ryu V2 build line 626
-# Ryu V2 build line 627
-# Ryu V2 build line 628
-# Ryu V2 build line 629
-# Ryu V2 build line 630
-# Ryu V2 build line 631
-# Ryu V2 build line 632
-# Ryu V2 build line 633
-# Ryu V2 build line 634
-# Ryu V2 build line 635
-# Ryu V2 build line 636
-# Ryu V2 build line 637
-# Ryu V2 build line 638
-# Ryu V2 build line 639
-# Ryu V2 build line 640
-# Ryu V2 build line 641
-# Ryu V2 build line 642
-# Ryu V2 build line 643
-# Ryu V2 build line 644
-# Ryu V2 build line 645
-# Ryu V2 build line 646
-# Ryu V2 build line 647
-# Ryu V2 build line 648
-# Ryu V2 build line 649
-# Ryu V2 build line 650
-# Ryu V2 build line 651
-# Ryu V2 build line 652
-# Ryu V2 build line 653
-# Ryu V2 build line 654
-# Ryu V2 build line 655
-# Ryu V2 build line 656
-# Ryu V2 build line 657
-# Ryu V2 build line 658
-# Ryu V2 build line 659
-# Ryu V2 build line 660
-# Ryu V2 build line 661
-# Ryu V2 build line 662
-# Ryu V2 build line 663
-# Ryu V2 build line 664
-# Ryu V2 build line 665
-# Ryu V2 build line 666
-# Ryu V2 build line 667
-# Ryu V2 build line 668
-# Ryu V2 build line 669
-# Ryu V2 build line 670
-# Ryu V2 build line 671
-# Ryu V2 build line 672
-# Ryu V2 build line 673
-# Ryu V2 build line 674
-# Ryu V2 build line 675
-# Ryu V2 build line 676
-# Ryu V2 build line 677
-# Ryu V2 build line 678
-# Ryu V2 build line 679
-# Ryu V2 build line 680
-# Ryu V2 build line 681
-# Ryu V2 build line 682
-# Ryu V2 build line 683
-# Ryu V2 build line 684
-# Ryu V2 build line 685
-# Ryu V2 build line 686
-# Ryu V2 build line 687
-# Ryu V2 build line 688
-# Ryu V2 build line 689
-# Ryu V2 build line 690
-# Ryu V2 build line 691
-# Ryu V2 build line 692
-# Ryu V2 build line 693
-# Ryu V2 build line 694
-# Ryu V2 build line 695
-# Ryu V2 build line 696
-# Ryu V2 build line 697
-# Ryu V2 build line 698
-# Ryu V2 build line 699
-# Ryu V2 build line 700
-# Ryu V2 build line 701
-# Ryu V2 build line 702
-# Ryu V2 build line 703
-# Ryu V2 build line 704
-# Ryu V2 build line 705
-# Ryu V2 build line 706
-# Ryu V2 build line 707
-# Ryu V2 build line 708
-# Ryu V2 build line 709
-# Ryu V2 build line 710
-# Ryu V2 build line 711
-# Ryu V2 build line 712
-# Ryu V2 build line 713
-# Ryu V2 build line 714
-# Ryu V2 build line 715
-# Ryu V2 build line 716
-# Ryu V2 build line 717
-# Ryu V2 build line 718
-# Ryu V2 build line 719
-# Ryu V2 build line 720
-# Ryu V2 build line 721
-# Ryu V2 build line 722
-# Ryu V2 build line 723
-# Ryu V2 build line 724
-# Ryu V2 build line 725
-# Ryu V2 build line 726
-# Ryu V2 build line 727
-# Ryu V2 build line 728
-# Ryu V2 build line 729
-# Ryu V2 build line 730
-# Ryu V2 build line 731
-# Ryu V2 build line 732
-# Ryu V2 build line 733
-# Ryu V2 build line 734
-# Ryu V2 build line 735
-# Ryu V2 build line 736
-# Ryu V2 build line 737
-# Ryu V2 build line 738
-# Ryu V2 build line 739
-# Ryu V2 build line 740
-# Ryu V2 build line 741
-# Ryu V2 build line 742
-# Ryu V2 build line 743
-# Ryu V2 build line 744
-# Ryu V2 build line 745
-# Ryu V2 build line 746
-# Ryu V2 build line 747
-# Ryu V2 build line 748
-# Ryu V2 build line 749
-# Ryu V2 build line 750
-# Ryu V2 build line 751
-# Ryu V2 build line 752
-# Ryu V2 build line 753
-# Ryu V2 build line 754
-# Ryu V2 build line 755
-# Ryu V2 build line 756
-# Ryu V2 build line 757
-# Ryu V2 build line 758
-# Ryu V2 build line 759
-# Ryu V2 build line 760
-# Ryu V2 build line 761
-# Ryu V2 build line 762
-# Ryu V2 build line 763
-# Ryu V2 build line 764
-# Ryu V2 build line 765
-# Ryu V2 build line 766
-# Ryu V2 build line 767
-# Ryu V2 build line 768
-# Ryu V2 build line 769
-# Ryu V2 build line 770
-# Ryu V2 build line 771
-# Ryu V2 build line 772
-# Ryu V2 build line 773
-# Ryu V2 build line 774
-# Ryu V2 build line 775
-# Ryu V2 build line 776
-# Ryu V2 build line 777
-# Ryu V2 build line 778
-# Ryu V2 build line 779
-# Ryu V2 build line 780
-# Ryu V2 build line 781
-# Ryu V2 build line 782
-# Ryu V2 build line 783
-# Ryu V2 build line 784
-# Ryu V2 build line 785
-# Ryu V2 build line 786
-# Ryu V2 build line 787
-# Ryu V2 build line 788
-# Ryu V2 build line 789
-# Ryu V2 build line 790
-# Ryu V2 build line 791
-# Ryu V2 build line 792
-# Ryu V2 build line 793
-# Ryu V2 build line 794
-# Ryu V2 build line 795
-# Ryu V2 build line 796
-# Ryu V2 build line 797
-# Ryu V2 build line 798
-# Ryu V2 build line 799
-# Ryu V2 build line 800
-# Ryu V2 build line 801
-# Ryu V2 build line 802
-# Ryu V2 build line 803
-# Ryu V2 build line 804
-# Ryu V2 build line 805
-# Ryu V2 build line 806
-# Ryu V2 build line 807
-# Ryu V2 build line 808
-# Ryu V2 build line 809
-# Ryu V2 build line 810
-# Ryu V2 build line 811
-# Ryu V2 build line 812
-# Ryu V2 build line 813
-# Ryu V2 build line 814
-# Ryu V2 build line 815
-# Ryu V2 build line 816
-# Ryu V2 build line 817
-# Ryu V2 build line 818
-# Ryu V2 build line 819
-# Ryu V2 build line 820
-# Ryu V2 build line 821
-# Ryu V2 build line 822
-# Ryu V2 build line 823
-# Ryu V2 build line 824
-# Ryu V2 build line 825
-# Ryu V2 build line 826
-# Ryu V2 build line 827
-# Ryu V2 build line 828
-# Ryu V2 build line 829
-# Ryu V2 build line 830
-# Ryu V2 build line 831
-# Ryu V2 build line 832
-# Ryu V2 build line 833
-# Ryu V2 build line 834
-# Ryu V2 build line 835
-# Ryu V2 build line 836
-# Ryu V2 build line 837
-# Ryu V2 build line 838
-# Ryu V2 build line 839
-# Ryu V2 build line 840
-# Ryu V2 build line 841
-# Ryu V2 build line 842
-# Ryu V2 build line 843
-# Ryu V2 build line 844
-# Ryu V2 build line 845
-# Ryu V2 build line 846
-# Ryu V2 build line 847
-# Ryu V2 build line 848
-# Ryu V2 build line 849
-# Ryu V2 build line 850
-# Ryu V2 build line 851
-# Ryu V2 build line 852
-# Ryu V2 build line 853
-# Ryu V2 build line 854
-# Ryu V2 build line 855
-# Ryu V2 build line 856
-# Ryu V2 build line 857
-# Ryu V2 build line 858
-# Ryu V2 build line 859
-# Ryu V2 build line 860
-# Ryu V2 build line 861
-# Ryu V2 build line 862
-# Ryu V2 build line 863
-# Ryu V2 build line 864
-# Ryu V2 build line 865
-# Ryu V2 build line 866
-# Ryu V2 build line 867
-# Ryu V2 build line 868
-# Ryu V2 build line 869
-# Ryu V2 build line 870
-# Ryu V2 build line 871
-# Ryu V2 build line 872
-# Ryu V2 build line 873
-# Ryu V2 build line 874
-# Ryu V2 build line 875
-# Ryu V2 build line 876
-# Ryu V2 build line 877
-# Ryu V2 build line 878
-# Ryu V2 build line 879
-# Ryu V2 build line 880
-# Ryu V2 build line 881
-# Ryu V2 build line 882
-# Ryu V2 build line 883
-# Ryu V2 build line 884
-# Ryu V2 build line 885
-# Ryu V2 build line 886
-# Ryu V2 build line 887
-# Ryu V2 build line 888
-# Ryu V2 build line 889
-# Ryu V2 build line 890
-# Ryu V2 build line 891
-# Ryu V2 build line 892
-# Ryu V2 build line 893
-# Ryu V2 build line 894
-# Ryu V2 build line 895
-# Ryu V2 build line 896
-# Ryu V2 build line 897
-# Ryu V2 build line 898
-# Ryu V2 build line 899
-# Ryu V2 build line 900
-# Ryu V2 build line 901
-# Ryu V2 build line 902
-# Ryu V2 build line 903
-# Ryu V2 build line 904
-# Ryu V2 build line 905
-# Ryu V2 build line 906
-# Ryu V2 build line 907
-# Ryu V2 build line 908
-# Ryu V2 build line 909
-# Ryu V2 build line 910
-# Ryu V2 build line 911
-# Ryu V2 build line 912
-# Ryu V2 build line 913
-# Ryu V2 build line 914
-# Ryu V2 build line 915
-# Ryu V2 build line 916
-# Ryu V2 build line 917
-# Ryu V2 build line 918
-# Ryu V2 build line 919
-# Ryu V2 build line 920
-# Ryu V2 build line 921
-# Ryu V2 build line 922
-# Ryu V2 build line 923
-# Ryu V2 build line 924
-# Ryu V2 build line 925
-# Ryu V2 build line 926
-# Ryu V2 build line 927
-# Ryu V2 build line 928
-# Ryu V2 build line 929
-# Ryu V2 build line 930
-# Ryu V2 build line 931
-# Ryu V2 build line 932
-# Ryu V2 build line 933
-# Ryu V2 build line 934
-# Ryu V2 build line 935
-# Ryu V2 build line 936
-# Ryu V2 build line 937
-# Ryu V2 build line 938
-# Ryu V2 build line 939
-# Ryu V2 build line 940
-# Ryu V2 build line 941
-# Ryu V2 build line 942
-# Ryu V2 build line 943
-# Ryu V2 build line 944
-# Ryu V2 build line 945
-# Ryu V2 build line 946
-# Ryu V2 build line 947
-# Ryu V2 build line 948
-# Ryu V2 build line 949
-# Ryu V2 build line 950
-# Ryu V2 build line 951
-# Ryu V2 build line 952
-# Ryu V2 build line 953
-# Ryu V2 build line 954
-# Ryu V2 build line 955
-# Ryu V2 build line 956
-# Ryu V2 build line 957
-# Ryu V2 build line 958
-# Ryu V2 build line 959
-# Ryu V2 build line 960
-# Ryu V2 build line 961
-# Ryu V2 build line 962
-# Ryu V2 build line 963
-# Ryu V2 build line 964
-# Ryu V2 build line 965
-# Ryu V2 build line 966
-# Ryu V2 build line 967
-# Ryu V2 build line 968
-# Ryu V2 build line 969
-# Ryu V2 build line 970
-# Ryu V2 build line 971
-# Ryu V2 build line 972
-# Ryu V2 build line 973
-# Ryu V2 build line 974
-# Ryu V2 build line 975
-# Ryu V2 build line 976
-# Ryu V2 build line 977
-# Ryu V2 build line 978
-# Ryu V2 build line 979
-# Ryu V2 build line 980
-# Ryu V2 build line 981
-# Ryu V2 build line 982
-# Ryu V2 build line 983
-# Ryu V2 build line 984
-# Ryu V2 build line 985
-# Ryu V2 build line 986
-# Ryu V2 build line 987
-# Ryu V2 build line 988
-# Ryu V2 build line 989
-# Ryu V2 build line 990
-# Ryu V2 build line 991
-# Ryu V2 build line 992
-# Ryu V2 build line 993
-# Ryu V2 build line 994
-# Ryu V2 build line 995
-# Ryu V2 build line 996
-# Ryu V2 build line 997
-# Ryu V2 build line 998
-# Ryu V2 build line 999
-# Ryu V2 build line 1000
-# Ryu V2 build line 1001
-# Ryu V2 build line 1002
-# Ryu V2 build line 1003
-# Ryu V2 build line 1004
-# Ryu V2 build line 1005
-# Ryu V2 build line 1006
-# Ryu V2 build line 1007
-# Ryu V2 build line 1008
-# Ryu V2 build line 1009
-# Ryu V2 build line 1010
-# Ryu V2 build line 1011
-# Ryu V2 build line 1012
-# Ryu V2 build line 1013
-# Ryu V2 build line 1014
-# Ryu V2 build line 1015
-# Ryu V2 build line 1016
-# Ryu V2 build line 1017
-# Ryu V2 build line 1018
-# Ryu V2 build line 1019
-# Ryu V2 build line 1020
-# Ryu V2 build line 1021
-# Ryu V2 build line 1022
-# Ryu V2 build line 1023
-# Ryu V2 build line 1024
-# Ryu V2 build line 1025
-# Ryu V2 build line 1026
-# Ryu V2 build line 1027
-# Ryu V2 build line 1028
-# Ryu V2 build line 1029
-# Ryu V2 build line 1030
-# Ryu V2 build line 1031
-# Ryu V2 build line 1032
-# Ryu V2 build line 1033
-# Ryu V2 build line 1034
-# Ryu V2 build line 1035
-# Ryu V2 build line 1036
-# Ryu V2 build line 1037
-# Ryu V2 build line 1038
-# Ryu V2 build line 1039
-# Ryu V2 build line 1040
-# Ryu V2 build line 1041
-# Ryu V2 build line 1042
-# Ryu V2 build line 1043
-# Ryu V2 build line 1044
-# Ryu V2 build line 1045
-# Ryu V2 build line 1046
-# Ryu V2 build line 1047
-# Ryu V2 build line 1048
-# Ryu V2 build line 1049
-# Ryu V2 build line 1050
-# Ryu V2 build line 1051
-# Ryu V2 build line 1052
-# Ryu V2 build line 1053
-# Ryu V2 build line 1054
-# Ryu V2 build line 1055
-# Ryu V2 build line 1056
-# Ryu V2 build line 1057
-# Ryu V2 build line 1058
-# Ryu V2 build line 1059
-# Ryu V2 build line 1060
-# Ryu V2 build line 1061
-# Ryu V2 build line 1062
-# Ryu V2 build line 1063
-# Ryu V2 build line 1064
-# Ryu V2 build line 1065
-# Ryu V2 build line 1066
-# Ryu V2 build line 1067
-# Ryu V2 build line 1068
-# Ryu V2 build line 1069
-# Ryu V2 build line 1070
-# Ryu V2 build line 1071
-# Ryu V2 build line 1072
-# Ryu V2 build line 1073
-# Ryu V2 build line 1074
-# Ryu V2 build line 1075
-# Ryu V2 build line 1076
-# Ryu V2 build line 1077
-# Ryu V2 build line 1078
-# Ryu V2 build line 1079
-# Ryu V2 build line 1080
-# Ryu V2 build line 1081
-# Ryu V2 build line 1082
-# Ryu V2 build line 1083
-# Ryu V2 build line 1084
-# Ryu V2 build line 1085
-# Ryu V2 build line 1086
-# Ryu V2 build line 1087
-# Ryu V2 build line 1088
-# Ryu V2 build line 1089
-# Ryu V2 build line 1090
-# Ryu V2 build line 1091
-# Ryu V2 build line 1092
-# Ryu V2 build line 1093
-# Ryu V2 build line 1094
-# Ryu V2 build line 1095
-# Ryu V2 build line 1096
-# Ryu V2 build line 1097
-# Ryu V2 build line 1098
-# Ryu V2 build line 1099
-# Ryu V2 build line 1100
-# Ryu V2 build line 1101
-# Ryu V2 build line 1102
-# Ryu V2 build line 1103
-# Ryu V2 build line 1104
-# Ryu V2 build line 1105
-# Ryu V2 build line 1106
-# Ryu V2 build line 1107
-# Ryu V2 build line 1108
-# Ryu V2 build line 1109
-# Ryu V2 build line 1110
-# Ryu V2 build line 1111
-# Ryu V2 build line 1112
-# Ryu V2 build line 1113
-# Ryu V2 build line 1114
-# Ryu V2 build line 1115
-# Ryu V2 build line 1116
-# Ryu V2 build line 1117
-# Ryu V2 build line 1118
-# Ryu V2 build line 1119
-# Ryu V2 build line 1120
-# Ryu V2 build line 1121
-# Ryu V2 build line 1122
-# Ryu V2 build line 1123
-# Ryu V2 build line 1124
-# Ryu V2 build line 1125
-# Ryu V2 build line 1126
-# Ryu V2 build line 1127
-# Ryu V2 build line 1128
-# Ryu V2 build line 1129
-# Ryu V2 build line 1130
-# Ryu V2 build line 1131
-# Ryu V2 build line 1132
-# Ryu V2 build line 1133
-# Ryu V2 build line 1134
-# Ryu V2 build line 1135
-# Ryu V2 build line 1136
-# Ryu V2 build line 1137
-# Ryu V2 build line 1138
-# Ryu V2 build line 1139
-# Ryu V2 build line 1140
-# Ryu V2 build line 1141
-# Ryu V2 build line 1142
-# Ryu V2 build line 1143
-# Ryu V2 build line 1144
-# Ryu V2 build line 1145
-# Ryu V2 build line 1146
-# Ryu V2 build line 1147
-# Ryu V2 build line 1148
-# Ryu V2 build line 1149
-# Ryu V2 build line 1150
-# Ryu V2 build line 1151
-# Ryu V2 build line 1152
-# Ryu V2 build line 1153
-# Ryu V2 build line 1154
-# Ryu V2 build line 1155
-# Ryu V2 build line 1156
-# Ryu V2 build line 1157
-# Ryu V2 build line 1158
-# Ryu V2 build line 1159
-# Ryu V2 build line 1160
-# Ryu V2 build line 1161
-# Ryu V2 build line 1162
-# Ryu V2 build line 1163
-# Ryu V2 build line 1164
-# Ryu V2 build line 1165
-# Ryu V2 build line 1166
-# Ryu V2 build line 1167
-# Ryu V2 build line 1168
-# Ryu V2 build line 1169
-# Ryu V2 build line 1170
-# Ryu V2 build line 1171
-# Ryu V2 build line 1172
-# Ryu V2 build line 1173
-# Ryu V2 build line 1174
-# Ryu V2 build line 1175
-# Ryu V2 build line 1176
-# Ryu V2 build line 1177
-# Ryu V2 build line 1178
-# Ryu V2 build line 1179
-# Ryu V2 build line 1180
-# Ryu V2 build line 1181
-# Ryu V2 build line 1182
-# Ryu V2 build line 1183
-# Ryu V2 build line 1184
-# Ryu V2 build line 1185
-# Ryu V2 build line 1186
-# Ryu V2 build line 1187
-# Ryu V2 build line 1188
-# Ryu V2 build line 1189
-# Ryu V2 build line 1190
-# Ryu V2 build line 1191
-# Ryu V2 build line 1192
-# Ryu V2 build line 1193
-# Ryu V2 build line 1194
-# Ryu V2 build line 1195
-# Ryu V2 build line 1196
-# Ryu V2 build line 1197
-# Ryu V2 build line 1198
-# Ryu V2 build line 1199
-# Ryu V2 build line 1200
-# Ryu V2 build line 1201
-# Ryu V2 build line 1202
-# Ryu V2 build line 1203
-# Ryu V2 build line 1204
-# Ryu V2 build line 1205
-# Ryu V2 build line 1206
-# Ryu V2 build line 1207
-# Ryu V2 build line 1208
-# Ryu V2 build line 1209
-# Ryu V2 build line 1210
-# Ryu V2 build line 1211
-# Ryu V2 build line 1212
-# Ryu V2 build line 1213
-# Ryu V2 build line 1214
-# Ryu V2 build line 1215
-# Ryu V2 build line 1216
-# Ryu V2 build line 1217
-# Ryu V2 build line 1218
-# Ryu V2 build line 1219
-# Ryu V2 build line 1220
-# Ryu V2 build line 1221
-# Ryu V2 build line 1222
-# Ryu V2 build line 1223
-# Ryu V2 build line 1224
-# Ryu V2 build line 1225
-# Ryu V2 build line 1226
-# Ryu V2 build line 1227
-# Ryu V2 build line 1228
-# Ryu V2 build line 1229
-# Ryu V2 build line 1230
-# Ryu V2 build line 1231
-# Ryu V2 build line 1232
-# Ryu V2 build line 1233
-# Ryu V2 build line 1234
-# Ryu V2 build line 1235
-# Ryu V2 build line 1236
-# Ryu V2 build line 1237
-# Ryu V2 build line 1238
-# Ryu V2 build line 1239
-# Ryu V2 build line 1240
-# Ryu V2 build line 1241
-# Ryu V2 build line 1242
-# Ryu V2 build line 1243
-# Ryu V2 build line 1244
-# Ryu V2 build line 1245
-# Ryu V2 build line 1246
-# Ryu V2 build line 1247
-# Ryu V2 build line 1248
-# Ryu V2 build line 1249
-# Ryu V2 build line 1250
-# Ryu V2 build line 1251
-# Ryu V2 build line 1252
-# Ryu V2 build line 1253
-# Ryu V2 build line 1254
-# Ryu V2 build line 1255
-# Ryu V2 build line 1256
-# Ryu V2 build line 1257
-# Ryu V2 build line 1258
-# Ryu V2 build line 1259
-# Ryu V2 build line 1260
-# Ryu V2 build line 1261
-# Ryu V2 build line 1262
-# Ryu V2 build line 1263
-# Ryu V2 build line 1264
-# Ryu V2 build line 1265
-# Ryu V2 build line 1266
-# Ryu V2 build line 1267
-# Ryu V2 build line 1268
-# Ryu V2 build line 1269
-# Ryu V2 build line 1270
-# Ryu V2 build line 1271
-# Ryu V2 build line 1272
-# Ryu V2 build line 1273
-# Ryu V2 build line 1274
-# Ryu V2 build line 1275
-# Ryu V2 build line 1276
-# Ryu V2 build line 1277
-# Ryu V2 build line 1278
-# Ryu V2 build line 1279
-# Ryu V2 build line 1280
-# Ryu V2 build line 1281
-# Ryu V2 build line 1282
-# Ryu V2 build line 1283
-# Ryu V2 build line 1284
-# Ryu V2 build line 1285
-# Ryu V2 build line 1286
-# Ryu V2 build line 1287
-# Ryu V2 build line 1288
-# Ryu V2 build line 1289
-# Ryu V2 build line 1290
-# Ryu V2 build line 1291
-# Ryu V2 build line 1292
-# Ryu V2 build line 1293
-# Ryu V2 build line 1294
-# Ryu V2 build line 1295
-# Ryu V2 build line 1296
-# Ryu V2 build line 1297
-# Ryu V2 build line 1298
-# Ryu V2 build line 1299
-# Ryu V2 build line 1300
-# Ryu V2 build line 1301
-# Ryu V2 build line 1302
-# Ryu V2 build line 1303
-# Ryu V2 build line 1304
-# Ryu V2 build line 1305
-# Ryu V2 build line 1306
-# Ryu V2 build line 1307
-# Ryu V2 build line 1308
-# Ryu V2 build line 1309
-# Ryu V2 build line 1310
-# Ryu V2 build line 1311
-# Ryu V2 build line 1312
-# Ryu V2 build line 1313
-# Ryu V2 build line 1314
-# Ryu V2 build line 1315
-# Ryu V2 build line 1316
-# Ryu V2 build line 1317
-# Ryu V2 build line 1318
-# Ryu V2 build line 1319
-# Ryu V2 build line 1320
-# Ryu V2 build line 1321
-# Ryu V2 build line 1322
-# Ryu V2 build line 1323
-# Ryu V2 build line 1324
-# Ryu V2 build line 1325
-# Ryu V2 build line 1326
-# Ryu V2 build line 1327
-# Ryu V2 build line 1328
-# Ryu V2 build line 1329
-# Ryu V2 build line 1330
-# Ryu V2 build line 1331
-# Ryu V2 build line 1332
-# Ryu V2 build line 1333
-# Ryu V2 build line 1334
-# Ryu V2 build line 1335
-# Ryu V2 build line 1336
-# Ryu V2 build line 1337
-# Ryu V2 build line 1338
-# Ryu V2 build line 1339
-# Ryu V2 build line 1340
-# Ryu V2 build line 1341
-# Ryu V2 build line 1342
-# Ryu V2 build line 1343
-# Ryu V2 build line 1344
-# Ryu V2 build line 1345
-# Ryu V2 build line 1346
-# Ryu V2 build line 1347
-# Ryu V2 build line 1348
-# Ryu V2 build line 1349
-# Ryu V2 build line 1350
-# Ryu V2 build line 1351
-# Ryu V2 build line 1352
-# Ryu V2 build line 1353
-# Ryu V2 build line 1354
-# Ryu V2 build line 1355
-# Ryu V2 build line 1356
-# Ryu V2 build line 1357
-# Ryu V2 build line 1358
-# Ryu V2 build line 1359
-# Ryu V2 build line 1360
-# Ryu V2 build line 1361
-# Ryu V2 build line 1362
-# Ryu V2 build line 1363
-# Ryu V2 build line 1364
-# Ryu V2 build line 1365
-# Ryu V2 build line 1366
-# Ryu V2 build line 1367
-# Ryu V2 build line 1368
-# Ryu V2 build line 1369
-# Ryu V2 build line 1370
-# Ryu V2 build line 1371
-# Ryu V2 build line 1372
-# Ryu V2 build line 1373
-# Ryu V2 build line 1374
-# Ryu V2 build line 1375
-# Ryu V2 build line 1376
-# Ryu V2 build line 1377
-# Ryu V2 build line 1378
-# Ryu V2 build line 1379
-# Ryu V2 build line 1380
-# Ryu V2 build line 1381
-# Ryu V2 build line 1382
-# Ryu V2 build line 1383
-# Ryu V2 build line 1384
-# Ryu V2 build line 1385
-# Ryu V2 build line 1386
-# Ryu V2 build line 1387
-# Ryu V2 build line 1388
-# Ryu V2 build line 1389
-# Ryu V2 build line 1390
-# Ryu V2 build line 1391
-# Ryu V2 build line 1392
-# Ryu V2 build line 1393
-# Ryu V2 build line 1394
-# Ryu V2 build line 1395
-# Ryu V2 build line 1396
-# Ryu V2 build line 1397
-# Ryu V2 build line 1398
-# Ryu V2 build line 1399
-# Ryu V2 build line 1400
+.logo{
+    display:flex;
+    align-items:center;
+    gap:12px;
+}
+
+.logo-mark{
+    width:47px;
+    height:47px;
+    border:2px solid #00ff72;
+    border-radius:12px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    color:#00ff72;
+    font-weight:900;
+    font-size:21px;
+    box-shadow:0 0 22px rgba(0,255,100,.3);
+}
+
+.logo-text{
+    font-size:24px;
+    font-weight:900;
+    letter-spacing:2px;
+}
+
+.logo-text span{
+    color:#00ff72;
+}
+
+.status{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    font-size:12px;
+    color:#72ffab;
+}
+
+.status-dot{
+    width:9px;
+    height:9px;
+    background:#00ff72;
+    border-radius:50%;
+    box-shadow:0 0 12px #00ff72;
+    animation:pulse 1.3s infinite;
+}
+
+@keyframes pulse{
+    50%{opacity:.35;transform:scale(.7);}
+}
+
+/* ================= NAV ================= */
+
+nav{
+    position:relative;
+    z-index:4;
+    display:flex;
+    gap:4px;
+    padding:10px 20px;
+    border-bottom:1px solid rgba(0,255,120,.12);
+    background:rgba(1,8,5,.85);
+    overflow-x:auto;
+}
+
+nav button{
+    border:0;
+    background:transparent;
+    color:#789184;
+    padding:11px 18px;
+    border-radius:8px;
+    cursor:pointer;
+    font-weight:bold;
+    white-space:nowrap;
+}
+
+nav button.active,
+nav button:hover{
+    color:#00ff72;
+    background:rgba(0,255,100,.08);
+}
+
+/* ================= MAIN ================= */
+
+.main{
+    position:relative;
+    z-index:2;
+    max-width:1500px;
+    margin:auto;
+    padding:18px;
+}
+
+.top-grid{
+    display:grid;
+    grid-template-columns:250px 1fr 310px;
+    gap:16px;
+}
+
+.panel{
+    border:1px solid rgba(0,255,110,.18);
+    background:rgba(3,18,11,.78);
+    border-radius:14px;
+    box-shadow:0 8px 35px rgba(0,0,0,.35);
+    overflow:hidden;
+}
+
+.panel-title{
+    padding:14px 16px;
+    border-bottom:1px solid rgba(0,255,100,.12);
+    font-size:12px;
+    color:#7d998b;
+    letter-spacing:1.3px;
+    text-transform:uppercase;
+}
+
+/* ================= RYU ================= */
+
+.ryu-panel{
+    min-height:570px;
+    position:relative;
+    background:
+        radial-gradient(circle at 50% 65%,rgba(0,255,90,.14),transparent 35%),
+        linear-gradient(180deg,rgba(3,18,11,.9),rgba(1,8,5,.98));
+}
+
+.ryu-title{
+    position:absolute;
+    top:18px;
+    left:18px;
+    font-size:22px;
+    font-weight:900;
+    letter-spacing:2px;
+    color:#fff;
+    z-index:2;
+}
+
+.ryu-title span{
+    color:#00ff72;
+}
+
+.ryu-stage{
+    position:absolute;
+    left:0;
+    right:0;
+    top:65px;
+    bottom:0;
+    overflow:hidden;
+}
+
+/* stylized Ryu */
+
+.ryu{
+    position:absolute;
+    left:50%;
+    top:53%;
+    width:120px;
+    height:240px;
+    transform:translate(-50%,-50%);
+}
+
+.head{
+    position:absolute;
+    width:52px;
+    height:55px;
+    background:#d69a69;
+    border-radius:48% 48% 43% 43%;
+    left:34px;
+    top:7px;
+    z-index:4;
+}
+
+.hair{
+    position:absolute;
+    width:72px;
+    height:65px;
+    left:23px;
+    top:-5px;
+    z-index:5;
+}
+
+.hair:before,
+.hair:after{
+    content:"";
+    position:absolute;
+    background:#161616;
+    width:32px;
+    height:48px;
+    transform:skew(-18deg) rotate(15deg);
+    top:0;
+}
+
+.hair:before{
+    left:4px;
+}
+
+.hair:after{
+    right:3px;
+    transform:skew(18deg) rotate(-15deg);
+}
+
+.bandana{
+    position:absolute;
+    z-index:6;
+    width:61px;
+    height:11px;
+    background:#dfe6df;
+    top:36px;
+    left:29px;
+    transform:rotate(-3deg);
+}
+
+.body{
+    position:absolute;
+    top:57px;
+    left:29px;
+    width:64px;
+    height:105px;
+    background:#ddd;
+    border-radius:18px 18px 10px 10px;
+    z-index:2;
+}
+
+.belt{
+    position:absolute;
+    top:137px;
+    left:24px;
+    width:75px;
+    height:
