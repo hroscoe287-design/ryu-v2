@@ -1,119 +1,398 @@
 import os
+import math
+import random
 from datetime import datetime, timezone
 
-from flask import Flask, jsonify, request, render_template_string
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-APP_NAME = "RYU V2"
-EXPIRY = "5 minutes"
 
-MARKETS = {
-    "Forex": [
-        "EUR/USD OTC",
-        "GBP/USD OTC",
-        "USD/JPY OTC",
-        "AUD/USD OTC",
-    ],
-    "Crypto": [
-        "BTC/USD OTC",
-        "ETH/USD OTC",
-        "SOL/USD OTC",
-        "XRP/USD OTC",
-    ],
-    "Stocks": [
-        "AAPL OTC",
-        "TSLA OTC",
-        "NVDA OTC",
-        "AMZN OTC",
-    ],
-}
+# ============================================================
+# RYU V2
+# SIGNAL-ONLY DASHBOARD
+# Does NOT place trades.
+# ============================================================
 
-state = {
-    "asset": "EUR/USD OTC",
-    "timeframe": "1m",
-    "signal": "WAIT",
-    "confidence": 0,
-    "payout": 80,
-    "price": 0,
-    "feed": False,
-    "updated": "Waiting for feed",
-    "candles": [],
+ASSETS = {
+    "Forex": {
+        "EUR/USD": "EURUSD=X",
+        "GBP/USD": "GBPUSD=X",
+        "USD/JPY": "JPY=X",
+        "AUD/USD": "AUDUSD=X",
+    },
+    "Crypto": {
+        "BTC/USDT": "BTC-USD",
+        "ETH/USDT": "ETH-USD",
+        "SOL/USDT": "SOL-USD",
+        "XRP/USDT": "XRP-USD",
+    },
+    "Stocks": {
+        "AAPL": "AAPL",
+        "TSLA": "TSLA",
+        "NVDA": "NVDA",
+        "AMZN": "AMZN",
+        "SPY": "SPY",
+        "QQQ": "QQQ",
+    },
 }
 
 
-def utc_now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+def get_asset_symbol(asset):
+    for group in ASSETS.values():
+        if asset in group:
+            return group[asset]
+    return None
 
 
-def make_signal():
-    candles = state["candles"]
+def get_market_data(asset, period="1d", interval="1m"):
+    symbol = get_asset_symbol(asset)
 
-    if len(candles) < 5:
-        return "WAIT", 0
+    if not symbol:
+        return None
 
     try:
-        closes = [float(c["close"]) for c in candles[-30:]]
-    except (KeyError, TypeError, ValueError):
-        return "WAIT", 0
+        data = yf.download(
+            symbol,
+            period=period,
+            interval=interval,
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+        )
 
-    if len(closes) < 5:
-        return "WAIT", 0
+        if data is None or data.empty:
+            return None
 
-    short = sum(closes[-5:]) / 5
-    long = sum(closes) / len(closes)
-    momentum = closes[-1] - closes[-4]
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
 
-    if short > long and momentum > 0:
-        confidence = min(95, 60 + int(abs(momentum) / max(closes[-1], 1) * 10000))
-        return "CALL", confidence
+        required = ["Open", "High", "Low", "Close"]
 
-    if short < long and momentum < 0:
-        confidence = min(95, 60 + int(abs(momentum) / max(closes[-1], 1) * 10000))
-        return "PUT", confidence
+        for column in required:
+            if column not in data.columns:
+                return None
 
-    return "WAIT", 35
+        data = data.dropna(subset=required).copy()
+
+        if len(data) < 20:
+            return None
+
+        return data
+
+    except Exception:
+        return None
 
 
-PAGE = """
+def ema(series, length):
+    return series.ewm(span=length, adjust=False).mean()
+
+
+def calculate_rsi(close, length=14):
+    delta = close.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1 / length,
+        adjust=False
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / length,
+        adjust=False
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+
+    rsi = 100 - (100 / (1 + rs))
+
+    return rsi.fillna(50)
+
+
+def calculate_macd(close):
+    fast = ema(close, 12)
+    slow = ema(close, 26)
+
+    macd = fast - slow
+    signal = ema(macd, 9)
+
+    return macd, signal
+
+
+def calculate_bollinger(close, length=20):
+    middle = close.rolling(length).mean()
+    std = close.rolling(length).std()
+
+    upper = middle + (std * 2)
+    lower = middle - (std * 2)
+
+    return upper, middle, lower
+
+
+def calculate_atr(data, length=14):
+    high = data["High"]
+    low = data["Low"]
+    close = data["Close"]
+
+    previous_close = close.shift(1)
+
+    ranges = pd.concat(
+        [
+            high - low,
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
+        ],
+        axis=1,
+    )
+
+    true_range = ranges.max(axis=1)
+
+    return true_range.rolling(length).mean()
+
+
+def generate_signal(data):
+    close = data["Close"]
+
+    current = float(close.iloc[-1])
+
+    ema9 = ema(close, 9)
+    ema21 = ema(close, 21)
+    ema50 = ema(close, 50)
+
+    rsi = calculate_rsi(close)
+
+    macd, macd_signal = calculate_macd(close)
+
+    upper, middle, lower = calculate_bollinger(close)
+
+    atr = calculate_atr(data)
+
+    score_call = 0
+    score_put = 0
+
+    confirmations = []
+
+    # --------------------------------------------------------
+    # TREND
+    # --------------------------------------------------------
+
+    if current > float(ema9.iloc[-1]):
+        score_call += 1
+        confirmations.append("Price above EMA 9")
+    else:
+        score_put += 1
+        confirmations.append("Price below EMA 9")
+
+    if float(ema9.iloc[-1]) > float(ema21.iloc[-1]):
+        score_call += 1
+        confirmations.append("EMA 9 above EMA 21")
+    else:
+        score_put += 1
+        confirmations.append("EMA 9 below EMA 21")
+
+    if float(ema21.iloc[-1]) > float(ema50.iloc[-1]):
+        score_call += 1
+        confirmations.append("EMA trend bullish")
+    else:
+        score_put += 1
+        confirmations.append("EMA trend bearish")
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    current_rsi = float(rsi.iloc[-1])
+
+    if 50 <= current_rsi <= 70:
+        score_call += 1
+        confirmations.append("RSI bullish")
+    elif 30 <= current_rsi < 50:
+        score_put += 1
+        confirmations.append("RSI bearish")
+
+    # --------------------------------------------------------
+    # MACD
+    # --------------------------------------------------------
+
+    current_macd = float(macd.iloc[-1])
+    current_macd_signal = float(macd_signal.iloc[-1])
+
+    if current_macd > current_macd_signal:
+        score_call += 1
+        confirmations.append("MACD bullish")
+    else:
+        score_put += 1
+        confirmations.append("MACD bearish")
+
+    # --------------------------------------------------------
+    # BOLLINGER
+    # --------------------------------------------------------
+
+    current_upper = float(upper.iloc[-1])
+    current_lower = float(lower.iloc[-1])
+
+    if current > float(middle.iloc[-1]) and current < current_upper:
+        score_call += 1
+        confirmations.append("Bollinger bullish zone")
+
+    elif current < float(middle.iloc[-1]) and current > current_lower:
+        score_put += 1
+        confirmations.append("Bollinger bearish zone")
+
+    # --------------------------------------------------------
+    # FINAL DECISION
+    # --------------------------------------------------------
+
+    total = max(score_call, score_put)
+
+    if total < 4:
+        direction = "WAIT"
+    elif score_call > score_put:
+        direction = "CALL"
+    elif score_put > score_call:
+        direction = "PUT"
+    else:
+        direction = "WAIT"
+
+    confidence = int(
+        min(
+            98,
+            max(
+                50,
+                50 + abs(score_call - score_put) * 8
+            )
+        )
+    )
+
+    if direction == "WAIT":
+        confidence = min(confidence, 59)
+
+    payout = 0
+
+    # Demo/display payout estimate only.
+    # Actual Pocket Option payout can differ.
+    if direction != "WAIT":
+        payout = random.choice([70, 75, 80, 85, 90])
+
+    volatility = float(atr.iloc[-1]) if not math.isnan(float(atr.iloc[-1])) else 0
+
+    return {
+        "direction": direction,
+        "confidence": confidence,
+        "price": round(current, 6),
+        "payout": payout,
+        "score_call": score_call,
+        "score_put": score_put,
+        "rsi": round(current_rsi, 2),
+        "atr": round(volatility, 6),
+        "confirmations": confirmations[-6:],
+    }
+
+
+def fallback_signal(asset):
+    return {
+        "direction": "WAIT",
+        "confidence": 50,
+        "price": 0,
+        "payout": 0,
+        "score_call": 0,
+        "score_put": 0,
+        "rsi": 50,
+        "atr": 0,
+        "confirmations": [
+            "Market data unavailable",
+            "Waiting for data",
+        ],
+    }
+
+
+def make_chart(data):
+    if data is None or data.empty:
+        return []
+
+    recent = data.tail(40)
+
+    result = []
+
+    for index, row in recent.iterrows():
+        try:
+            timestamp = str(index)
+
+            if hasattr(index, "strftime"):
+                timestamp = index.strftime("%H:%M")
+
+            result.append(
+                {
+                    "time": timestamp,
+                    "open": float(row["Open"]),
+                    "high": float(row["High"]),
+                    "low": float(row["Low"]),
+                    "close": float(row["Close"]),
+                }
+            )
+
+        except Exception:
+            continue
+
+    return result
+
+
+# ============================================================
+# DASHBOARD HTML
+# ============================================================
+
+HTML = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>RYU V2</title>
+<meta charset="UTF-8">
+<meta name="viewport"
+content="width=device-width, initial-scale=1.0">
+
+<title>Ryu V2</title>
 
 <style>
+
 * {
     box-sizing: border-box;
 }
 
 body {
     margin: 0;
-    background: #070b12;
+    background:
+        radial-gradient(circle at top, #241111 0%, #090909 45%, #030303 100%);
     color: #ffffff;
-    font-family: Arial, sans-serif;
+    font-family: Arial, Helvetica, sans-serif;
 }
 
 .header {
-    background: #0c121c;
-    border-bottom: 1px solid #263447;
     padding: 18px;
+    border-bottom: 1px solid #333;
+    background: rgba(0,0,0,.8);
+    position: sticky;
+    top: 0;
+    z-index: 10;
 }
 
-.logo {
+.brand {
     font-size: 28px;
     font-weight: 900;
-    letter-spacing: 3px;
+    letter-spacing: 2px;
 }
 
-.subtitle {
-    color: #8d9bad;
+.brand span {
+    color: #ff3131;
+}
+
+.status {
+    color: #00ff7f;
     font-size: 12px;
     margin-top: 5px;
-}
-
-.fire {
-    font-size: 30px;
 }
 
 .nav {
@@ -123,18 +402,20 @@ body {
     overflow-x: auto;
 }
 
-.nav span {
+.nav button,
+.filter button {
+    background: #151515;
+    color: white;
+    border: 1px solid #444;
+    border-radius: 8px;
     padding: 10px 14px;
-    background: #121b29;
-    border: 1px solid #28374b;
-    border-radius: 10px;
-    font-size: 13px;
-    white-space: nowrap;
+    cursor: pointer;
 }
 
-.nav .active {
-    background: #20334b;
-    color: white;
+.nav button.active,
+.filter button.active {
+    background: #b90000;
+    border-color: #ff3333;
 }
 
 .container {
@@ -143,249 +424,147 @@ body {
     padding: 15px;
 }
 
-.controls {
+.filters {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
-    margin-bottom: 12px;
+    gap: 10px;
+    margin-bottom: 15px;
 }
 
-.card {
-    background: #0d141f;
-    border: 1px solid #1e2b3d;
-    border-radius: 15px;
-    padding: 15px;
-}
-
-label {
-    display: block;
-    color: #8290a2;
-    font-size: 11px;
-    text-transform: uppercase;
-    margin-bottom: 7px;
+.filter {
+    display: flex;
+    gap: 7px;
+    overflow-x: auto;
 }
 
 select {
     width: 100%;
-    padding: 12px;
-    border-radius: 10px;
-    border: 1px solid #304158;
-    background: #111a27;
+    padding: 13px;
+    background: #111;
     color: white;
+    border: 1px solid #444;
+    border-radius: 8px;
 }
 
 .grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
+    grid-template-columns: 1fr;
+    gap: 15px;
+}
+
+.card {
+    background: rgba(16,16,16,.94);
+    border: 1px solid #333;
+    border-radius: 15px;
+    padding: 18px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.4);
 }
 
 .signal-card {
-    min-height: 230px;
     text-align: center;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
 }
 
 .signal {
-    font-size: 55px;
-    font-weight: 1000;
-    margin: 12px;
+    font-size: 48px;
+    font-weight: 900;
+    margin: 15px 0;
 }
 
 .call {
-    color: #39e58c;
+    color: #00ff88;
 }
 
 .put {
-    color: #ff5964;
+    color: #ff3030;
 }
 
 .wait {
-    color: #ffc857;
+    color: #ffd43b;
 }
 
 .confidence {
-    font-size: 17px;
-    font-weight: bold;
-}
-
-.progress {
-    width: 80%;
-    height: 10px;
-    background: #182536;
-    border-radius: 20px;
-    margin-top: 12px;
-    overflow: hidden;
-}
-
-.progress-bar {
-    height: 100%;
-    width: 0%;
-    background: #39e58c;
-}
-
-.row {
-    display: flex;
-    justify-content: space-between;
-    padding: 11px 0;
-    border-bottom: 1px solid #1b2737;
-}
-
-.big {
     font-size: 22px;
     font-weight: bold;
 }
 
-.status {
-    display: flex;
-    align-items: center;
-    gap: 9px;
+.metric-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+    margin-top: 15px;
 }
 
-.dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    background: #ff5964;
+.metric {
+    background: #0d0d0d;
+    border: 1px solid #292929;
+    border-radius: 10px;
+    padding: 12px;
 }
 
-.dot.live {
-    background: #39e58c;
+.metric small {
+    color: #888;
+    display: block;
 }
 
-.chart-card {
-    grid-column: 1 / -1;
+.metric strong {
+    font-size: 18px;
 }
 
 .chart {
     width: 100%;
-    height: 280px;
-    background: #080d14;
-    border-radius: 12px;
-    margin-top: 12px;
+    height: 260px;
+    background: #080808;
+    border-radius: 10px;
+    border: 1px solid #292929;
+    overflow: hidden;
 }
 
-@media (max-width: 700px) {
+svg {
+    width: 100%;
+    height: 100%;
+}
+
+.confluence {
+    margin-top: 10px;
+}
+
+.confirm {
+    padding: 9px;
+    margin-top: 6px;
+    background: #101010;
+    border-left: 3px solid #ff3030;
+    border-radius: 5px;
+    font-size: 13px;
+}
+
+.footer {
+    text-align: center;
+    color: #666;
+    padding: 30px 10px;
+    font-size: 12px;
+}
+
+@media (min-width: 800px) {
+
     .grid {
-        grid-template-columns: 1fr;
+        grid-template-columns: 1fr 1fr;
     }
 
-    .chart-card {
-        grid-column: auto;
+    .signal-card {
+        grid-row: span 2;
     }
+
 }
+
 </style>
 </head>
 
 <body>
 
 <div class="header">
-    <div class="logo">
-        <span class="fire">🔥</span> RYU V2
+
+    <div class="brand">
+        RYU <span>V2</span>
     </div>
 
-    <div class="subtitle">
-        SIGNAL ENGINE • 5 MINUTE EXPIRY • SIGNALS ONLY
-    </div>
-
-    <div class="nav">
-        <span class="active">Signals</span>
-        <span>Trades</span>
-        <span>Performance</span>
-        <span>Settings</span>
-    </div>
-</div>
-
-<div class="container">
-
-    <div class="controls">
-
-        <div class="card">
-            <label>Market</label>
-            <select id="asset"></select>
-        </div>
-
-        <div class="card">
-            <label>Signal Timeframe</label>
-
-            <select id="timeframe">
-                <option value="1m">1 Minute</option>
-                <option value="2m">2 Minutes</option>
-                <option value="3m">3 Minutes</option>
-            </select>
-        </div>
-
-    </div>
-
-    <div class="grid">
-
-        <div class="card signal-card">
-
-            <label>RYU SIGNAL</label>
-
-            <div id="signal" class="signal wait">
-                WAIT
-            </div>
-
-            <div id="confidence" class="confidence">
-                Confidence: 0%
-            </div>
-
-            <div class="progress">
-                <div id="progress" class="progress-bar"></div>
-            </div>
-
-        </div>
-
-        <div class="card">
-
-            <label>Trade Setup</label>
-
-            <div class="row">
-                <span>Asset</span>
-                <b id="setupAsset">EUR/USD OTC</b>
-            </div>
-
-            <div class="row">
-                <span>Entry</span>
-                <b id="entry">—</b>
-            </div>
-
-            <div class="row">
-                <span>Payout</span>
-                <b id="payout">80%</b>
-            </div>
-
-            <div class="row">
-                <span>Expiry</span>
-                <b>5 Minutes</b>
-            </div>
-
-        </div>
-
-        <div class="card chart-card">
-
-            <div class="status">
-                <span id="dot" class="dot"></span>
-                <b id="feedStatus">WAITING FOR LIVE FEED</b>
-            </div>
-
-            <div class="chart">
-                <canvas id="chart"></canvas>
-            </div>
-
-        </div>
-
-        <div class="card">
-
-            <label>Confluence</label>
-
-            <div class="row">
-                <span>Trend</span>
-                <b id="trend">WAIT</b>
-            </div>
-
-            <div class="row">
+    <div class="status">
+        ● SIGNAL
