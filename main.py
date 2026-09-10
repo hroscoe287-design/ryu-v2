@@ -1,319 +1,110 @@
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, render_template, jsonify, request
+import os
 import random
-import math
 import time
 from datetime import datetime
 
 app = Flask(__name__)
 
-# ============================================================
-# RYU V2 — FULL VISUAL DASHBOARD
-# ============================================================
 
-HTML = r"""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>RYU V2 — AI Trading Dashboard</title>
+# ---------------------------------------------------------
+# RYU V2 ASSETS
+# ---------------------------------------------------------
 
-<style>
-*{
-    box-sizing:border-box;
-    margin:0;
-    padding:0;
+ASSETS = {
+    "Forex": [
+        "EUR/USD OTC",
+        "GBP/USD OTC",
+        "USD/JPY OTC",
+        "AUD/USD OTC",
+        "USD/CAD OTC",
+        "USD/CHF OTC",
+        "NZD/USD OTC",
+    ],
+
+    "Crypto": [
+        "BTC/USD OTC",
+        "ETH/USD OTC",
+        "SOL/USD OTC",
+        "XRP/USD OTC",
+        "LTC/USD OTC",
+        "DOGE/USD OTC",
+    ],
+
+    "Stocks": [
+        "AAPL OTC",
+        "TSLA OTC",
+        "NVDA OTC",
+        "AMZN OTC",
+        "META OTC",
+        "MSFT OTC",
+        "GOOGL OTC",
+    ],
+
+    "Commodities": [
+        "GOLD OTC",
+        "SILVER OTC",
+        "PLATINUM OTC",
+        "COPPER OTC",
+    ],
+
+    "Indices": [
+        "SP500 OTC",
+        "NASDAQ OTC",
+        "DOW JONES OTC",
+        "RUSSELL 2000 OTC",
+    ],
 }
 
-html,body{
-    width:100%;
-    min-height:100%;
-    font-family:Arial,Helvetica,sans-serif;
-    background:#020b07;
-    color:#fff;
-}
 
-body{
-    overflow-x:hidden;
-}
+TIMEFRAMES = [
+    "1m",
+    "2m",
+    "3m",
+    "5m",
+    "10m",
+    "15m",
+    "30m",
+    "1h",
+    "2h",
+    "4h",
+    "6h",
+    "12h",
+    "1D",
+    "1W",
+    "1M",
+]
 
-/* ================= BACKGROUND ================= */
 
-body:before{
-    content:"";
-    position:fixed;
-    inset:0;
-    background:
-        linear-gradient(rgba(0,255,110,.035) 1px,transparent 1px),
-        linear-gradient(90deg,rgba(0,255,110,.035) 1px,transparent 1px);
-    background-size:35px 35px;
-    pointer-events:none;
-    z-index:0;
-}
+# ---------------------------------------------------------
+# DEMO PRICES
+# ---------------------------------------------------------
 
-.glow{
-    position:fixed;
-    width:500px;
-    height:500px;
-    border-radius:50%;
-    background:rgba(0,255,100,.08);
-    filter:blur(90px);
-    left:-180px;
-    top:100px;
-    z-index:0;
-}
+BASE_PRICES = {
+    "EUR/USD OTC": 1.08420,
+    "GBP/USD OTC": 1.26840,
+    "USD/JPY OTC": 147.820,
+    "AUD/USD OTC": 0.65240,
+    "USD/CAD OTC": 1.35820,
+    "USD/CHF OTC": 0.87920,
+    "NZD/USD OTC": 0.61120,
 
-.glow2{
-    position:fixed;
-    width:450px;
-    height:450px;
-    border-radius:50%;
-    background:rgba(0,180,255,.05);
-    filter:blur(100px);
-    right:-180px;
-    bottom:-100px;
-    z-index:0;
-}
+    "BTC/USD OTC": 105420.00,
+    "ETH/USD OTC": 3850.00,
+    "SOL/USD OTC": 218.40,
+    "XRP/USD OTC": 2.410,
+    "LTC/USD OTC": 112.40,
+    "DOGE/USD OTC": 0.2140,
 
-/* ================= HEADER ================= */
+    "AAPL OTC": 237.40,
+    "TSLA OTC": 348.20,
+    "NVDA OTC": 177.80,
+    "AMZN OTC": 231.40,
+    "META OTC": 742.10,
+    "MSFT OTC": 511.20,
+    "GOOGL OTC": 241.80,
 
-header{
-    position:relative;
-    z-index:5;
-    height:76px;
-    border-bottom:1px solid rgba(0,255,120,.2);
-    background:rgba(2,12,8,.92);
-    backdrop-filter:blur(12px);
-    display:flex;
-    align-items:center;
-    justify-content:space-between;
-    padding:0 22px;
-}
-
-.logo{
-    display:flex;
-    align-items:center;
-    gap:12px;
-}
-
-.logo-mark{
-    width:47px;
-    height:47px;
-    border:2px solid #00ff72;
-    border-radius:12px;
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    color:#00ff72;
-    font-weight:900;
-    font-size:21px;
-    box-shadow:0 0 22px rgba(0,255,100,.3);
-}
-
-.logo-text{
-    font-size:24px;
-    font-weight:900;
-    letter-spacing:2px;
-}
-
-.logo-text span{
-    color:#00ff72;
-}
-
-.status{
-    display:flex;
-    align-items:center;
-    gap:8px;
-    font-size:12px;
-    color:#72ffab;
-}
-
-.status-dot{
-    width:9px;
-    height:9px;
-    background:#00ff72;
-    border-radius:50%;
-    box-shadow:0 0 12px #00ff72;
-    animation:pulse 1.3s infinite;
-}
-
-@keyframes pulse{
-    50%{opacity:.35;transform:scale(.7);}
-}
-
-/* ================= NAV ================= */
-
-nav{
-    position:relative;
-    z-index:4;
-    display:flex;
-    gap:4px;
-    padding:10px 20px;
-    border-bottom:1px solid rgba(0,255,120,.12);
-    background:rgba(1,8,5,.85);
-    overflow-x:auto;
-}
-
-nav button{
-    border:0;
-    background:transparent;
-    color:#789184;
-    padding:11px 18px;
-    border-radius:8px;
-    cursor:pointer;
-    font-weight:bold;
-    white-space:nowrap;
-}
-
-nav button.active,
-nav button:hover{
-    color:#00ff72;
-    background:rgba(0,255,100,.08);
-}
-
-/* ================= MAIN ================= */
-
-.main{
-    position:relative;
-    z-index:2;
-    max-width:1500px;
-    margin:auto;
-    padding:18px;
-}
-
-.top-grid{
-    display:grid;
-    grid-template-columns:250px 1fr 310px;
-    gap:16px;
-}
-
-.panel{
-    border:1px solid rgba(0,255,110,.18);
-    background:rgba(3,18,11,.78);
-    border-radius:14px;
-    box-shadow:0 8px 35px rgba(0,0,0,.35);
-    overflow:hidden;
-}
-
-.panel-title{
-    padding:14px 16px;
-    border-bottom:1px solid rgba(0,255,100,.12);
-    font-size:12px;
-    color:#7d998b;
-    letter-spacing:1.3px;
-    text-transform:uppercase;
-}
-
-/* ================= RYU ================= */
-
-.ryu-panel{
-    min-height:570px;
-    position:relative;
-    background:
-        radial-gradient(circle at 50% 65%,rgba(0,255,90,.14),transparent 35%),
-        linear-gradient(180deg,rgba(3,18,11,.9),rgba(1,8,5,.98));
-}
-
-.ryu-title{
-    position:absolute;
-    top:18px;
-    left:18px;
-    font-size:22px;
-    font-weight:900;
-    letter-spacing:2px;
-    color:#fff;
-    z-index:2;
-}
-
-.ryu-title span{
-    color:#00ff72;
-}
-
-.ryu-stage{
-    position:absolute;
-    left:0;
-    right:0;
-    top:65px;
-    bottom:0;
-    overflow:hidden;
-}
-
-/* stylized Ryu */
-
-.ryu{
-    position:absolute;
-    left:50%;
-    top:53%;
-    width:120px;
-    height:240px;
-    transform:translate(-50%,-50%);
-}
-
-.head{
-    position:absolute;
-    width:52px;
-    height:55px;
-    background:#d69a69;
-    border-radius:48% 48% 43% 43%;
-    left:34px;
-    top:7px;
-    z-index:4;
-}
-
-.hair{
-    position:absolute;
-    width:72px;
-    height:65px;
-    left:23px;
-    top:-5px;
-    z-index:5;
-}
-
-.hair:before,
-.hair:after{
-    content:"";
-    position:absolute;
-    background:#161616;
-    width:32px;
-    height:48px;
-    transform:skew(-18deg) rotate(15deg);
-    top:0;
-}
-
-.hair:before{
-    left:4px;
-}
-
-.hair:after{
-    right:3px;
-    transform:skew(18deg) rotate(-15deg);
-}
-
-.bandana{
-    position:absolute;
-    z-index:6;
-    width:61px;
-    height:11px;
-    background:#dfe6df;
-    top:36px;
-    left:29px;
-    transform:rotate(-3deg);
-}
-
-.body{
-    position:absolute;
-    top:57px;
-    left:29px;
-    width:64px;
-    height:105px;
-    background:#ddd;
-    border-radius:18px 18px 10px 10px;
-    z-index:2;
-}
-
-.belt{
-    position:absolute;
-    top:137px;
-    left:24px;
-    width:75px;
-    height:
+    "GOLD OTC": 3650.00,
+    "SILVER OTC": 42.10,
+    "PLATINUM OTC": 1390.00,
+    "COPPER OTC": 4.58
