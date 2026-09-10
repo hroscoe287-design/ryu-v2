@@ -1,110 +1,173 @@
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template_string, jsonify
 import os
 import random
-import time
 from datetime import datetime
 
 app = Flask(__name__)
 
+HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ryu V2</title>
 
-# ---------------------------------------------------------
-# RYU V2 ASSETS
-# ---------------------------------------------------------
-
-ASSETS = {
-    "Forex": [
-        "EUR/USD OTC",
-        "GBP/USD OTC",
-        "USD/JPY OTC",
-        "AUD/USD OTC",
-        "USD/CAD OTC",
-        "USD/CHF OTC",
-        "NZD/USD OTC",
-    ],
-
-    "Crypto": [
-        "BTC/USD OTC",
-        "ETH/USD OTC",
-        "SOL/USD OTC",
-        "XRP/USD OTC",
-        "LTC/USD OTC",
-        "DOGE/USD OTC",
-    ],
-
-    "Stocks": [
-        "AAPL OTC",
-        "TSLA OTC",
-        "NVDA OTC",
-        "AMZN OTC",
-        "META OTC",
-        "MSFT OTC",
-        "GOOGL OTC",
-    ],
-
-    "Commodities": [
-        "GOLD OTC",
-        "SILVER OTC",
-        "PLATINUM OTC",
-        "COPPER OTC",
-    ],
-
-    "Indices": [
-        "SP500 OTC",
-        "NASDAQ OTC",
-        "DOW JONES OTC",
-        "RUSSELL 2000 OTC",
-    ],
+<style>
+* {
+    box-sizing: border-box;
 }
 
+body {
+    margin: 0;
+    background: #071b12;
+    color: #ffffff;
+    font-family: Arial, sans-serif;
+}
 
-TIMEFRAMES = [
-    "1m",
-    "2m",
-    "3m",
-    "5m",
-    "10m",
-    "15m",
-    "30m",
-    "1h",
-    "2h",
-    "4h",
-    "6h",
-    "12h",
-    "1D",
-    "1W",
-    "1M",
-]
+.header {
+    padding: 18px;
+    background: linear-gradient(135deg, #09281a, #0d4a2a);
+    border-bottom: 1px solid #1c7042;
+}
 
+.logo {
+    font-size: 28px;
+    font-weight: 900;
+    color: #43ff91;
+}
 
-# ---------------------------------------------------------
-# DEMO PRICES
-# ---------------------------------------------------------
+.subtitle {
+    color: #9ccdb1;
+    font-size: 13px;
+    margin-top: 4px;
+}
 
-BASE_PRICES = {
-    "EUR/USD OTC": 1.08420,
-    "GBP/USD OTC": 1.26840,
-    "USD/JPY OTC": 147.820,
-    "AUD/USD OTC": 0.65240,
-    "USD/CAD OTC": 1.35820,
-    "USD/CHF OTC": 0.87920,
-    "NZD/USD OTC": 0.61120,
+.nav {
+    display: flex;
+    gap: 8px;
+    padding: 12px;
+    overflow-x: auto;
+    background: #06150e;
+}
 
-    "BTC/USD OTC": 105420.00,
-    "ETH/USD OTC": 3850.00,
-    "SOL/USD OTC": 218.40,
-    "XRP/USD OTC": 2.410,
-    "LTC/USD OTC": 112.40,
-    "DOGE/USD OTC": 0.2140,
+.nav button {
+    background: #103522;
+    color: #b9e8c9;
+    border: 1px solid #245f3e;
+    padding: 10px 16px;
+    border-radius: 8px;
+}
 
-    "AAPL OTC": 237.40,
-    "TSLA OTC": 348.20,
-    "NVDA OTC": 177.80,
-    "AMZN OTC": 231.40,
-    "META OTC": 742.10,
-    "MSFT OTC": 511.20,
-    "GOOGL OTC": 241.80,
+.nav button.active {
+    background: #18a957;
+    color: white;
+}
 
-    "GOLD OTC": 3650.00,
-    "SILVER OTC": 42.10,
-    "PLATINUM OTC": 1390.00,
-    "COPPER OTC": 4.58
+.container {
+    padding: 14px;
+    max-width: 1100px;
+    margin: auto;
+}
+
+.filters {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    margin-bottom: 14px;
+}
+
+select {
+    width: 100%;
+    padding: 12px;
+    border-radius: 8px;
+    border: 1px solid #276e48;
+    background: #0b291a;
+    color: white;
+}
+
+.card {
+    background: #0a2517;
+    border: 1px solid #1b5e39;
+    border-radius: 14px;
+    padding: 16px;
+    margin-bottom: 14px;
+}
+
+.signal-card {
+    text-align: center;
+    padding: 22px;
+}
+
+.signal {
+    font-size: 42px;
+    font-weight: 900;
+    margin: 12px 0;
+}
+
+.call {
+    color: #35ff83;
+}
+
+.put {
+    color: #ff5964;
+}
+
+.wait {
+    color: #ffd45a;
+}
+
+.confidence {
+    font-size: 20px;
+    color: #b8e8c9;
+}
+
+.stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+}
+
+.stat {
+    background: #0d321f;
+    border-radius: 10px;
+    padding: 12px;
+}
+
+.stat-title {
+    font-size: 11px;
+    color: #8fb9a0;
+}
+
+.stat-value {
+    font-size: 19px;
+    font-weight: bold;
+    margin-top: 5px;
+}
+
+.chart {
+    height: 270px;
+    position: relative;
+    overflow: hidden;
+    background:
+        linear-gradient(rgba(50,255,130,.07) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(50,255,130,.07) 1px, transparent 1px);
+    background-size: 40px 40px;
+    border: 1px solid #1d7545;
+    border-radius: 10px;
+}
+
+.chart svg {
+    width: 100%;
+    height: 100%;
+}
+
+.fireball {
+    text-align: center;
+    font-size: 70px;
+    margin: 5px 0;
+    filter: drop-shadow(0 0 12px #ff7b00);
+}
+
+.confluence {
+    display: flex
