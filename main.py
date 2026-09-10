@@ -1,213 +1,566 @@
 import os
-import json
+import math
+import random
 import time
-import logging
-import asyncio
-import numpy as np
-import pandas as pd
-from datetime import datetime
-from fastapi import FastAPI, WebSocket
-from fastapi.responses import HTMLResponse
+import threading
+from collections import defaultdict, deque
+from datetime import datetime, timezone
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
-logger = logging.getLogger("RYU_V2_FINAL")
+from flask import Flask, jsonify, request, render_template_string
 
-app = FastAPI()
+# ============================================================
+# RYU V2
+# COMPLETE SIGNAL DASHBOARD
+# ============================================================
+#
+# SIGNAL ONLY.
+# This application does NOT place Pocket Option trades.
+#
+# Render start command:
+#     gunicorn main:app
+#
+# Optional environment variables:
+#     RYU_NAME=RYU V2
+#     RYU_DEMO=true
+#     DEFAULT_PAYOUT=80
+#     SIGNAL_THRESHOLD=68
+# ============================================================
 
-# -------------------------------------------------------------------
-# POCKETOPTION ASSET MATRIX
-# -------------------------------------------------------------------
-POCKETOPTION_ASSET_MARKET = {
-    "FOREX": [
-        {"id": "EUR/USD_OTC", "name": "EUR/USD OTC", "payout": "92%"},
-        {"id": "GBP/USD_OTC", "name": "GBP/USD OTC", "payout": "92%"},
-        {"id": "USD/JPY_OTC", "name": "USD/JPY OTC", "payout": "91%"},
-        {"id": "AUD/USD_OTC", "name": "AUD/USD OTC", "payout": "91%"},
-        {"id": "EUR/GBP_OTC", "name": "EUR/GBP OTC", "payout": "88%"}
-    ],
-    "CRYPTO": [
-        {"id": "BTC/USDT_OTC", "name": "BTC/USDT OTC", "payout": "88%"},
-        {"id": "ETH/USDT_OTC", "name": "ETH/USDT OTC", "payout": "87%"}
-    ],
-    "STOCKS": [
-        {"id": "AAPL_OTC", "name": "Apple OTC", "payout": "85%"},
-        {"id": "TSLA_OTC", "name": "Tesla OTC", "payout": "84%"}
-    ],
-    "COMMODITIES": [
-        {"id": "XAU/USD_OTC", "name": "Gold OTC", "payout": "86%"},
-        {"id": "XAG/USD_OTC", "name": "Silver OTC", "payout": "84%"}
-    ]
+app = Flask(__name__)
+
+RYU_NAME = os.getenv("RYU_NAME", "RYU V2")
+DEMO_MODE = os.getenv("RYU_DEMO", "true").lower() not in (
+    "false",
+    "0",
+    "no",
+)
+
+DEFAULT_PAYOUT = float(os.getenv("DEFAULT_PAYOUT", "80"))
+SIGNAL_THRESHOLD = float(os.getenv("SIGNAL_THRESHOLD", "68"))
+
+lock = threading.Lock()
+
+market_data = defaultdict(lambda: deque(maxlen=240))
+latest_signal = {}
+trade_log = deque(maxlen=200)
+
+feed_status = {
+    "connected": False,
+    "last_update": None,
+    "source": "RYU Demo Market Engine" if DEMO_MODE else "Waiting for feed",
 }
 
-class RyuFullInterfaceEngine:
-    def __init__(self):
-        self.active_asset = "EUR/USD_OTC"
-        self.active_payout = "92%"
-        self.candles = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'timestamp'])
-        self.active_connections: list[WebSocket] = []
-        self.historical_trades = [
-            {"asset": "EUR/USD OTC", "dir": "CALL", "res": "WIN", "payout": "92%", "time": "14:12"},
-            {"asset": "GBP/USD OTC", "dir": "PUT", "res": "WIN", "payout": "92%", "time": "13:58"},
-            {"asset": "BTC/USDT OTC", "dir": "CALL", "res": "WIN", "payout": "88%", "time": "13:42"}
-        ]
 
-    def compute_all_indicators(self, base_price: float) -> dict:
-        now = time.time()
-        if len(self.candles) < 35:
-            prices = base_price + np.random.normal(0, 0.0002, 50).cumsum()
-            self.candles = pd.DataFrame({
-                'close': prices, 'high': prices + 0.0001, 'low': prices - 0.0001, 'open': prices,
-                'timestamp': [now - (i * 60) for i in range(50)][::-1]
-            })
-        
-        new_row = pd.DataFrame([{'open': base_price, 'high': base_price+0.00005, 'low': base_price-0.00005, 'close': base_price, 'timestamp': now}])
-        self.candles = pd.concat([self.candles, new_row], ignore_index=True).iloc[-60:]
-        df = self.candles.copy().reset_index(drop=True)
+# ============================================================
+# ASSETS
+# ============================================================
 
-        # Technical Indicators Vector Math
-        df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
-        df['alligator_lips'] = df['close'].ewm(alpha=1/5, adjust=False).mean().shift(3)
-        df['alligator_teeth'] = df['close'].ewm(alpha=1/8, adjust=False).mean().shift(5)
-        
-        df['fractal_high'] = (df['high'] > df['high'].shift(1)) & (df['high'] > df['high'].shift(2))
-        df['fractal_low'] = (df['low'] < df['low'].shift(1)) & (df['low'] < df['low'].shift(2))
+ASSETS = {
+    "Forex": [
+        "EUR/USD OTC",
+        "GBP/USD OTC",
+        "USD/JPY OTC",
+        "AUD/USD OTC",
+        "USD/CAD OTC",
+        "USD/CHF OTC",
+        "EUR/GBP OTC",
+    ],
+    "Crypto": [
+        "BTC/USD OTC",
+        "ETH/USD OTC",
+        "SOL/USD OTC",
+        "XRP/USD OTC",
+    ],
+    "Stocks": [
+        "AAPL OTC",
+        "TSLA OTC",
+        "NVDA OTC",
+        "AMZN OTC",
+        "SPY OTC",
+        "QQQ OTC",
+    ],
+}
 
-        tp = (df['high'] + df['low'] + df['close']) / 3
-        sma_tp = tp.rolling(window=14).mean()
-        mad = tp.rolling(window=14).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
-        df['cci'] = np.where(mad != 0, (tp - sma_tp) / (0.015 * mad), 0)
 
-        ema_12 = df['close'].ewm(span=12, adjust=False).mean()
-        ema_26 = df['close'].ewm(span=26, adjust=False).mean()
-        df['macd_line'] = ema_12 - ema_26
-        df['macd_sig'] = df['macd_line'].ewm(span=9, adjust=False).mean()
+# ============================================================
+# HELPERS
+# ============================================================
 
-        latest = df.iloc[-1].fillna(base_price).to_dict()
-        
-        signal = "HOLD"
-        confidence = "45%"
-        if base_price > latest.get('ema_9', base_price) and latest.get('macd_line', 0) > latest.get('macd_sig', 0):
-            signal = "CALL"
-            confidence = "92%"
-        elif base_price < latest.get('ema_9', base_price) and latest.get('macd_line', 0) < latest.get('macd_sig', 0):
-            signal = "PUT"
-            confidence = "91%"
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
+
+def seed_prices(asset):
+    prices = {
+        "BTC/USD OTC": 65000.0,
+        "ETH/USD OTC": 3200.0,
+        "SOL/USD OTC": 145.0,
+        "XRP/USD OTC": 0.62,
+
+        "EUR/USD OTC": 1.1050,
+        "GBP/USD OTC": 1.3100,
+        "USD/JPY OTC": 147.5,
+        "AUD/USD OTC": 0.6650,
+        "USD/CAD OTC": 1.3600,
+        "USD/CHF OTC": 0.8850,
+        "EUR/GBP OTC": 0.8440,
+
+        "AAPL OTC": 225.0,
+        "TSLA OTC": 245.0,
+        "NVDA OTC": 180.0,
+        "AMZN OTC": 230.0,
+        "SPY OTC": 650.0,
+        "QQQ OTC": 575.0,
+    }
+
+    return prices.get(asset, 100.0)
+
+
+def make_demo_candle(asset, previous=None):
+    if previous is None:
+        previous = seed_prices(asset)
+
+    volatility = max(previous * 0.0009, 0.00005)
+
+    change = random.gauss(0, volatility)
+
+    close = max(previous + change, 0.00001)
+
+    high = max(previous, close) + abs(
+        random.gauss(0, volatility * 0.55)
+    )
+
+    low = min(previous, close) - abs(
+        random.gauss(0, volatility * 0.55)
+    )
+
+    return {
+        "time": int(time.time()),
+        "open": previous,
+        "high": high,
+        "low": max(low, 0.000001),
+        "close": close,
+    }
+
+
+# ============================================================
+# INDICATORS
+# ============================================================
+
+def sma(values, period):
+    if not values:
+        return 0.0
+
+    sample = values[-period:]
+
+    return sum(sample) / len(sample)
+
+
+def ema(values, period):
+    if not values:
+        return 0.0
+
+    multiplier = 2 / (period + 1)
+
+    result = values[0]
+
+    for value in values[1:]:
+        result = (
+            value * multiplier
+            + result * (1 - multiplier)
+        )
+
+    return result
+
+
+def rsi(values, period=14):
+    if len(values) < 2:
+        return 50.0
+
+    changes = [
+        values[i] - values[i - 1]
+        for i in range(1, len(values))
+    ]
+
+    recent = changes[-period:]
+
+    gains = sum(
+        max(change, 0)
+        for change in recent
+    ) / max(len(recent), 1)
+
+    losses = sum(
+        max(-change, 0)
+        for change in recent
+    ) / max(len(recent), 1)
+
+    if losses == 0:
+        return 100.0
+
+    relative_strength = gains / losses
+
+    return 100 - (
+        100 / (1 + relative_strength)
+    )
+
+
+def macd_values(values):
+    fast = ema(values, 12)
+    slow = ema(values, 26)
+
+    macd = fast - slow
+
+    recent = values[-35:] if len(values) >= 35 else values
+
+    signal = ema(recent, 9)
+
+    return macd, signal
+
+
+def bollinger(values, period=20):
+    if not values:
+        return 0.0, 0.0, 0.0
+
+    sample = values[-period:]
+
+    middle = sum(sample) / len(sample)
+
+    variance = sum(
+        (value - middle) ** 2
+        for value in sample
+    ) / len(sample)
+
+    deviation = math.sqrt(variance)
+
+    lower = middle - (2 * deviation)
+    upper = middle + (2 * deviation)
+
+    return lower, middle, upper
+
+
+def alligator(values):
+    """
+    Lightweight Williams Alligator-style lines.
+
+    Jaw   = 13
+    Teeth = 8
+    Lips  = 5
+    """
+
+    jaw = sma(values, 13)
+    teeth = sma(values, 8)
+    lips = sma(values, 5)
+
+    return jaw, teeth, lips
+
+
+# ============================================================
+# RYU SIGNAL ENGINE
+# ============================================================
+
+def analyze(asset, timeframe):
+    with lock:
+        candles = list(market_data[asset])
+
+    closes = [
+        candle["close"]
+        for candle in candles
+    ]
+
+    if len(closes) < 12:
         return {
-            "price": round(base_price, 5),
-            "signal": signal,
-            "confidence": confidence,
-            "ema9": round(latest.get('ema_9', base_price), 5),
-            "lips": round(latest.get('alligator_lips', base_price), 5),
-            "teeth": round(latest.get('alligator_teeth', base_price), 5),
-            "cci": round(latest.get('cci', 0), 2),
-            "macd": round(latest.get('macd_line', 0), 6),
-            "macdsig": round(latest.get('macd_sig', 0), 6),
-            "frac_high": bool(latest.get('fractal_high', False)),
-            "frac_low": bool(latest.get('fractal_low', False)),
-            "candles": df[['timestamp', 'open', 'high', 'low', 'close', 'ema_9', 'alligator_lips', 'alligator_teeth']].tail(30).to_dict(orient="records")
+            "direction": "WAIT",
+            "confidence": 50,
+            "entry": (
+                closes[-1]
+                if closes
+                else seed_prices(asset)
+            ),
+            "reason": "Building market history",
+            "confluence": [
+                "Waiting for more candles"
+            ],
+            "timeframe": timeframe,
+            "expiry": "5m",
+            "payout": DEFAULT_PAYOUT,
         }
 
-interface_engine = RyuFullInterfaceEngine()
+    price = closes[-1]
 
-async def po_feed_simulator():
-    current_price = 1.08437
+    fast_ma = sma(closes, 5)
+    slow_ma = sma(closes, 20)
+
+    current_rsi = rsi(closes)
+
+    macd, macd_signal = macd_values(closes)
+
+    bb_low, bb_mid, bb_high = bollinger(closes)
+
+    jaw, teeth, lips = alligator(closes)
+
+    call_score = 0
+    put_score = 0
+
+    call_reasons = []
+    put_reasons = []
+
+    # --------------------------------------------------------
+    # PRICE / FAST MA
+    # --------------------------------------------------------
+
+    if price > fast_ma:
+        call_score += 1
+        call_reasons.append(
+            "Price above fast MA"
+        )
+    else:
+        put_score += 1
+        put_reasons.append(
+            "Price below fast MA"
+        )
+
+    # --------------------------------------------------------
+    # MOVING AVERAGE TREND
+    # --------------------------------------------------------
+
+    if fast_ma > slow_ma:
+        call_score += 1
+        call_reasons.append(
+            "MA trend bullish"
+        )
+    else:
+        put_score += 1
+        put_reasons.append(
+            "MA trend bearish"
+        )
+
+    # --------------------------------------------------------
+    # MACD
+    # --------------------------------------------------------
+
+    if macd > macd_signal:
+        call_score += 1
+        call_reasons.append(
+            "MACD bullish"
+        )
+    else:
+        put_score += 1
+        put_reasons.append(
+            "MACD bearish"
+        )
+
+    # --------------------------------------------------------
+    # ALLIGATOR
+    # --------------------------------------------------------
+
+    if lips > teeth > jaw:
+        call_score += 2
+        call_reasons.append(
+            "Alligator aligned bullish"
+        )
+
+    elif lips < teeth < jaw:
+        put_score += 2
+        put_reasons.append(
+            "Alligator aligned bearish"
+        )
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    if current_rsi < 35:
+        call_score += 1
+        call_reasons.append(
+            "RSI recovering from low"
+        )
+
+    elif current_rsi > 65:
+        put_score += 1
+        put_reasons.append(
+            "RSI cooling from high"
+        )
+
+    # --------------------------------------------------------
+    # BOLLINGER
+    # --------------------------------------------------------
+
+    if price <= bb_low:
+        call_score += 1
+        call_reasons.append(
+            "Near lower Bollinger band"
+        )
+
+    elif price >= bb_high:
+        put_score += 1
+        put_reasons.append(
+            "Near upper Bollinger band"
+        )
+
+    # --------------------------------------------------------
+    # FINAL DIRECTION
+    # --------------------------------------------------------
+
+    if call_score > put_score:
+        direction = "CALL"
+        strength = call_score
+        reasons = call_reasons
+
+    elif put_score > call_score:
+        direction = "PUT"
+        strength = put_score
+        reasons = put_reasons
+
+    else:
+        direction = "WAIT"
+        strength = 0
+        reasons = [
+            "Confluence is mixed"
+        ]
+
+    # --------------------------------------------------------
+    # CONFIDENCE
+    # --------------------------------------------------------
+
+    confidence = min(
+        97,
+        55 + int((strength / 8) * 42)
+    )
+
+    if confidence < SIGNAL_THRESHOLD:
+        direction = "WAIT"
+        reasons = [
+            "Setup below Ryu confidence threshold"
+        ]
+
+    return {
+        "direction": direction,
+        "confidence": confidence,
+        "entry": price,
+        "reason": " • ".join(reasons[:3]),
+        "confluence": reasons[:6],
+
+        "rsi": round(current_rsi, 1),
+
+        "ma_fast": fast_ma,
+        "ma_slow": slow_ma,
+
+        "macd": macd,
+        "macd_signal": macd_signal,
+
+        "bb_low": bb_low,
+        "bb_mid": bb_mid,
+        "bb_high": bb_high,
+
+        "alligator": {
+            "jaw": jaw,
+            "teeth": teeth,
+            "lips": lips,
+        },
+
+        "timeframe": timeframe,
+
+        # USER REQUESTED EXPIRY
+        "expiry": "5m",
+
+        "payout": DEFAULT_PAYOUT,
+    }
+
+
+# ============================================================
+# DEMO MARKET ENGINE
+# ============================================================
+
+def demo_worker():
     while True:
+
         try:
-            await asyncio.sleep(1)
-            current_price += np.random.normal(0, 0.00008)
-            metrics = interface_engine.compute_all_indicators(current_price)
-            
-            payload = {
-                "asset": interface_engine.active_asset,
-                "payout": interface_engine.active_payout,
-                "metrics": metrics,
-                "market_list": POCKETOPTION_ASSET_MARKET,
-                "trades": interface_engine.historical_trades
-            }
-            
-            for ws in list(interface_engine.active_connections):
-                try:
-                    await ws.send_text(json.dumps(payload))
-                except Exception:
-                    if ws in interface_engine.active_connections:
-                        interface_engine.active_connections.remove(ws)
+
+            for category in ASSETS.values():
+
+                for asset in category:
+
+                    with lock:
+
+                        if market_data[asset]:
+
+                            previous = (
+                                market_data[asset][-1]["close"]
+                            )
+
+                        else:
+
+                            previous = seed_prices(asset)
+
+                        candle = make_demo_candle(
+                            asset,
+                            previous
+                        )
+
+                        market_data[asset].append(
+                            candle
+                        )
+
+                        feed_status[
+                            "last_update"
+                        ] = now_iso()
+
+                        feed_status[
+                            "connected"
+                        ] = True
+
+                        feed_status[
+                            "source"
+                        ] = "RYU Demo Market Engine"
+
+                    signal = analyze(
+                        asset,
+                        "1m"
+                    )
+
+                    with lock:
+                        latest_signal[asset] = signal
+
+            time.sleep(2)
+
         except Exception:
-            await asyncio.sleep(2)
+            time.sleep(2)
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(po_feed_simulator())
 
-@app.websocket("/ws/telemetry")
-async def telemetry_socket(websocket: WebSocket):
-    await websocket.accept()
-    interface_engine.active_connections.append(websocket)
-    try:
-        while True:
-            data = await websocket.receive_text()
-            msg = json.loads(data)
-            if msg.get("action") == "change_asset":
-                interface_engine.active_asset = msg.get("asset")
-                interface_engine.active_payout = msg.get("payout")
-    except Exception:
-        if websocket in interface_engine.active_connections:
-            interface_engine.active_connections.remove(websocket)
+if DEMO_MODE:
 
-@app.get("/", response_class=HTMLResponse)
-async def serve_dashboard():
-    return """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>RYU V2 AI TRADING ASSISTANT</title>
-        <style>
-            :root {
-                --bg-deep: #050814; --panel-bg: #090e1f; --panel-border: #141b34;
-                --text-glow: #00ffcc; --neon-red: #ff2a5f; --neon-blue: #0099ff;
-            }
-            body {
-                background-color: var(--bg-deep); color: #ffffff; font-family: 'Segoe UI', sans-serif;
-                margin: 0; padding: 10px; overflow: hidden; height: 100vh; box-sizing: border-box;
-            }
-            .dashboard-layout {
-                display: grid; grid-template-columns: 280px 1fr 320px; gap: 10px; height: 100%;
-            }
-            .panel {
-                background: var(--panel-bg); border: 1px solid var(--panel-border);
-                border-radius: 8px; padding: 12px; display: flex; flex-direction: column; overflow: hidden;
-            }
-            .header-banner {
-                display: flex; justify-content: space-between; align-items: center; padding: 5px 10px;
-                border-bottom: 2px solid var(--neon-blue); margin-bottom: 8px;
-            }
-            .header-banner h1 { margin: 0; font-size: 20px; color: #fff; font-style: italic; font-weight: 900; }
-            .header-banner h1 span { color: var(--neon-red); }
-            
-            .asset-scroll-box { flex: 1; overflow-y: auto; font-size: 12px; }
-            .category-title { color: #5a6e9c; font-weight: bold; margin: 10px 0 4px 0; text-transform: uppercase; font-size: 11px; }
-            .asset-item {
-                display: flex; justify-content: space-between; padding: 6px 8px; margin-bottom: 2px;
-                background: #0d142c; border-radius: 4px; cursor: pointer; border: 1px solid transparent;
-            }
-            .asset-item:hover, .asset-item.active { border-color: var(--text-glow); background: #121c3e; }
-            .payout-green { color: #00ff66; font-weight: bold; }
+    threading.Thread(
+        target=demo_worker,
+        daemon=True
+    ).start()
 
-            .chart-view-panel { flex: 1; position: relative; background: #040712; border-radius: 6px; margin: 8px 0; }
-            canvas { width: 100%; height: 100%; display: block; }
-            
-            .signal-badge-overlay {
-                position: absolute; top: 15px; left: 50%; transform: translateX(-50%);
-                padding: 10px 30px; border-radius: 6px; font-weight: bold; font-size: 16px; text-align: center;
-                z-index: 10;
-            }
-            .signal-call { background: #00ff66; color: #000; }
-            .signal-put { background: var(--neon-red); color: #fff; }
-            .signal-hold { background: #222; color: #aaa; }
 
-            .signal-profile-card { text-align: center; padding: 15px; background: #0c1530; border-radius: 6px; border: 1px solid #1c2a59; }
-            .big-call-btn {
-                background: #00e658; color: #000; font-weight: 900; font-size: 22px;
-                border: none; padding: 15px; width: 100%; border-radius: 6px; cursor: pointer; margin-top: 15px;
-            }
+# ============================================================
+# ROUTES
+# ============================================================
+
+@app.get("/")
+def index():
+
+    return render_template_string(
+        PAGE,
+        ryu_name=RYU_NAME
+    )
+
+
+@app.get("/api/health")
+def health():
+
+    return jsonify({
+        "ok": True,
+        "name": RYU_NAME,
+        "demo_mode": DEMO_MODE,
+        "feed": feed_status,
+        "time": now_iso(),
+    })
+
+
+@app.get("/api/assets")
+def assets():
+
+    return jsonify
