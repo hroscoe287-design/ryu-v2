@@ -1,322 +1,215 @@
-from flask import Flask, jsonify
 import os
+import json
 import time
+import logging
+import asyncio
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from fastapi import FastAPI, WebSocket
+from fastapi.responses import HTMLResponse
 
-app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("RYU_V2_FULL_UI")
 
+app = FastAPI()
 
-@app.route("/")
-def home():
+# -------------------------------------------------------------------
+# ALL POCKETOPTION ASSET TIERS & INITIAL SYSTEM DATA
+# -------------------------------------------------------------------
+POCKETOPTION_ASSET_MARKET = {
+    "FOREX": [
+        {"id": "EUR/USD_OTC", "name": "EUR/USD OTC", "payout": "92%", "trend": "up"},
+        {"id": "GBP/USD_OTC", "name": "GBP/USD OTC", "payout": "92%", "trend": "up"},
+        {"id": "USD/JPY_OTC", "name": "USD/JPY OTC", "payout": "91%", "trend": "up"},
+        {"id": "AUD/USD_OTC", "name": "AUD/USD OTC", "payout": "91%", "trend": "up"},
+        {"id": "EUR/GBP_OTC", "name": "EUR/GBP OTC", "payout": "88%", "trend": "up"},
+    ],
+    "CRYPTO": [
+        {"id": "BTC/USDT_OTC", "name": "BTC/USDT OTC", "payout": "88%", "trend": "up"},
+        {"id": "ETH/USDT_OTC", "name": "ETH/USDT OTC", "payout": "87%", "trend": "up"},
+        {"id": "SOL/USDT_OTC", "name": "SOL/USDT OTC", "payout": "85%", "trend": "down"},
+    ],
+    "STOCKS": [
+        {"id": "AAPL_OTC", "name": "Apple OTC", "payout": "85%", "trend": "up"},
+        {"id": "TSLA_OTC", "name": "Tesla OTC", "payout": "84%", "trend": "up"},
+        {"id": "MSFT_OTC", "name": "Microsoft OTC", "payout": "83%", "trend": "up"},
+    ],
+    "COMMODITIES": [
+        {"id": "XAU/USD_OTC", "name": "Gold OTC", "payout": "86%", "trend": "up"},
+        {"id": "XAG/USD_OTC", "name": "Silver OTC", "payout": "84%", "trend": "up"},
+    ],
+    "OIL_GAS": [
+        {"id": "USOIL_OTC", "name": "USOIL OTC", "payout": "83%", "trend": "up"},
+        {"id": "UKOIL_OTC", "name": "UKOIL OTC", "payout": "82%", "trend": "down"},
+    ]
+}
+
+class RyuFullInterfaceEngine:
+    def __init__(self):
+        self.active_asset = "EUR/USD_OTC"
+        self.active_payout = "92%"
+        self.candles = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'timestamp'])
+        self.active_connections: list[WebSocket] = []
+        self.historical_trades = [
+            {"asset": "EUR/USD OTC", "dir": "CALL", "res": "WIN", "payout": "92%", "time": "14:12"},
+            {"asset": "GBP/JPY OTC", "dir": "PUT", "res": "WIN", "payout": "92%", "time": "13:58"},
+            {"asset": "BTC/USDT Asset", "dir": "CALL", "res": "WIN", "payout": "88%", "time": "13:42"},
+            {"asset": "XAU/USD OTC", "dir": "PUT", "res": "LOSS", "payout": "86%", "time": "13:28"},
+        ]
+
+    def compute_all_indicators(self, base_price: float) -> dict:
+        """Processes math functions for the full technical dashboard stack."""
+        now = time.time()
+        # Seed running dataframes
+        if len(self.candles) < 30:
+            prices = base_price + np.random.normal(0, 0.0002, 40).cumsum()
+            self.candles = pd.DataFrame({
+                'close': prices, 'high': prices + 0.0001, 'low': prices - 0.0001, 'open': prices,
+                'timestamp': [now - (i * 60) for i in range(40)][::-1]
+            })
+        
+        # Append latest tick
+        new_row = pd.DataFrame([{'open': base_price, 'high': base_price+0.00005, 'low': base_price-0.00005, 'close': base_price, 'timestamp': now}])
+        self.candles = pd.concat([self.candles, new_row], ignore_index=True).iloc[-50:]
+        df = self.candles.copy().reset_index(drop=True)
+
+        # Technical Indicators Calculations
+        df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
+        df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
+        df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
+        
+        # Alligator
+        df['alligator_jaw'] = df['close'].ewm(alpha=1/13, adjust=False).mean().shift(8)
+        df['alligator_teeth'] = df['close'].ewm(alpha=1/8, adjust=False).mean().shift(5)
+        df['alligator_lips'] = df['close'].ewm(alpha=1/5, adjust=False).mean().shift(3)
+
+        # Oscillators (RSI & MACD)
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / (loss + 1e-9)
+        df['rsi'] = 100 - (100 / (1 + rs))
+        df['rsi'] = df['rsi'].fillna(50)
+
+        ema_12 = df['close'].ewm(span=12, adjust=False).mean()
+        ema_26 = df['close'].ewm(span=26, adjust=False).mean()
+        df['macd_line'] = ema_12 - ema_26
+        df['macd_sig'] = df['macd_line'].ewm(span=9, adjust=False).mean()
+        df['macd_hist'] = df['macd_line'] - df['macd_sig']
+
+        latest = df.iloc[-1].fillna(base_price).to_dict()
+        
+        # Confluence Bias Check
+        signal = "HOLD"
+        confidence = "45%"
+        if base_price > latest.get('ema_9', base_price) and latest.get('macd_line', 0) > latest.get('macd_sig', 0):
+            signal = "CALL"
+            confidence = "92%"
+        elif base_price < latest.get('ema_9', base_price) and latest.get('macd_line', 0) < latest.get('macd_sig', 0):
+            signal = "PUT"
+            confidence = "91%"
+
+        return {
+            "price": round(base_price, 5),
+            "signal": signal,
+            "confidence": confidence,
+            "ema9": round(latest.get('ema_9', base_price), 5),
+            "ema20": round(latest.get('ema_20', base_price), 5),
+            "ema50": round(latest.get('ema_50', base_price), 5),
+            "jaw": round(latest.get('alligator_jaw', base_price), 5),
+            "teeth": round(latest.get('alligator_teeth', base_price), 5),
+            "lips": round(latest.get('alligator_lips', base_price), 5),
+            "rsi": round(latest.get('rsi', 50), 2),
+            "macd": round(latest.get('macd_line', 0), 6),
+            "macdsig": round(latest.get('macd_sig', 0), 6),
+            "candles": df[['timestamp', 'open', 'high', 'low', 'close', 'ema_9', 'ema_20', 'ema_50']].tail(30).to_dict(orient="records")
+        }
+
+interface_engine = RyuFullInterfaceEngine()
+
+async def po_feed_simulator():
+    """Background data pipeline mapping metrics out to connected sockets."""
+    current_price = 1.08437
+    while True:
+        try:
+            await asyncio.sleep(1)
+            current_price += np.random.normal(0, 0.00008)
+            metrics = interface_engine.compute_all_indicators(current_price)
+            
+            payload = {
+                "asset": interface_engine.active_asset,
+                "payout": interface_engine.active_payout,
+                "metrics": metrics,
+                "market_list": POCKETOPTION_ASSET_MARKET,
+                "trades": interface_engine.historical_trades
+            }
+            
+            # Broadcast metrics directly to client session states
+            for ws in interface_engine.active_connections:
+                try:
+                    await ws.send_text(json.dumps(payload))
+                except:
+                    interface_engine.active_connections.remove(ws)
+        except Exception as e:
+            await asyncio.sleep(2)
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(po_feed_simulator())
+
+@app.websocket("/ws/telemetry")
+async def telemetry_socket(websocket: WebSocket):
+    await websocket.accept()
+    interface_engine.active_connections.append(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            msg = json.loads(data)
+            if msg.get("action") == "change_asset":
+                interface_engine.active_asset = msg.get("asset")
+                interface_engine.active_payout = msg.get("payout")
+    except:
+        interface_engine.active_connections.remove(websocket)
+
+# -------------------------------------------------------------------
+# THE FRONT-END USER INTERFACE SPECIFICATIONS (RYU V2 STYLED)
+# -------------------------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+async def serve_dashboard():
     return """
     <!DOCTYPE html>
-    <html>
+    <html lang="en">
     <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Ryu V2</title>
+        <meta charset="UTF-8">
+        <title>RYU V2 AI TRADING ASSISTANT</title>
         <style>
+            :root {
+                --bg-deep: #050814; --panel-bg: #090e1f; --panel-border: #141b34;
+                --text-glow: #00ffcc; --neon-red: #ff2a5f; --neon-blue: #0099ff;
+            }
             body {
-                margin: 0;
-                background: #080b12;
-                color: white;
-                font-family: Arial, sans-serif;
-                text-align: center;
+                background-color: var(--bg-deep); color: #ffffff; font-family: 'Segoe UI', sans-serif;
+                margin: 0; padding: 10px; overflow: hidden; height: 100vh; box-sizing: border-box;
             }
-
-            .header {
-                padding: 22px;
-                background: #111722;
-                border-bottom: 1px solid #252d3a;
+            .dashboard-layout {
+                display: grid; grid-template-columns: 280px 1fr 320px; gap: 10px; height: 100%;
             }
-
-            .logo {
-                font-size: 30px;
-                font-weight: bold;
+            .panel {
+                background: var(--panel-bg); border: 1px solid var(--panel-border);
+                border-radius: 8px; padding: 12px; display: flex; flex-direction: column; overflow: hidden;
             }
-
-            .red {
-                color: #ff3030;
+            .header-banner {
+                display: flex; justify-content: space-between; align-items: center; padding: 5px 10px;
+                border-bottom: 2px solid var(--neon-blue); margin-bottom: 8px;
             }
-
-            .online {
-                display: inline-block;
-                margin-top: 10px;
-                padding: 7px 14px;
-                border-radius: 20px;
-                background: #123522;
-                color: #49ff91;
-                font-size: 13px;
-                font-weight: bold;
+            .header-banner h1 { margin: 0; font-size: 20px; color: #fff; font-style: italic; font-weight: 900; }
+            .header-banner h1 span { color: var(--neon-red); }
+            
+            /* Sidebar Lists */
+            .asset-scroll-box { flex: 1; overflow-y: auto; font-size: 12px; }
+            .category-title { color: #5a6e9c; font-weight: bold; margin: 10px 0 4px 0; text-transform: uppercase; font-size: 11px; }
+            .asset-item {
+                display: flex; justify-content: space-between; padding: 6px 8px; margin-bottom: 2px;
+                background: #0d142c; border-radius: 4px; cursor: pointer; border: 1px solid transparent;
             }
-
-            .nav {
-                display: flex;
-                justify-content: center;
-                gap: 8px;
-                padding: 15px;
-                flex-wrap: wrap;
-            }
-
-            .nav div {
-                padding: 10px 16px;
-                background: #151c28;
-                border-radius: 10px;
-                color: #aeb7c5;
-            }
-
-            .nav .active {
-                background: #e52b35;
-                color: white;
-            }
-
-            .container {
-                max-width: 900px;
-                margin: auto;
-                padding: 15px;
-            }
-
-            .card {
-                background: #111722;
-                border: 1px solid #252d3a;
-                border-radius: 20px;
-                padding: 30px 20px;
-                margin-top: 10px;
-            }
-
-            .ryu {
-                font-size: 55px;
-            }
-
-            .signal {
-                font-size: 55px;
-                font-weight: 900;
-                margin: 15px;
-                color: #ffd43b;
-            }
-
-            .confidence {
-                font-size: 20px;
-                color: #c3cad5;
-            }
-
-            .expiry {
-                margin-top: 12px;
-                color: #8e99aa;
-            }
-
-            .grid {
-                display: grid;
-                grid-template-columns: repeat(4, 1fr);
-                gap: 10px;
-                margin-top: 15px;
-            }
-
-            .box {
-                background: #111722;
-                border: 1px solid #252d3a;
-                border-radius: 14px;
-                padding: 18px 8px;
-            }
-
-            .label {
-                font-size: 11px;
-                color: #7e8999;
-            }
-
-            .value {
-                margin-top: 7px;
-                font-size: 19px;
-                font-weight: bold;
-            }
-
-            .section {
-                background: #111722;
-                border: 1px solid #252d3a;
-                border-radius: 16px;
-                margin-top: 15px;
-                padding: 20px;
-                text-align: left;
-            }
-
-            .section h2 {
-                margin-top: 0;
-            }
-
-            .item {
-                display: flex;
-                justify-content: space-between;
-                padding: 10px 0;
-                border-bottom: 1px solid #202734;
-            }
-
-            .green {
-                color: #49ff91;
-            }
-
-            .footer {
-                padding: 25px;
-                color: #596576;
-                font-size: 11px;
-            }
-
-            @media (max-width: 600px) {
-                .grid {
-                    grid-template-columns: repeat(2, 1fr);
-                }
-
-                .signal {
-                    font-size: 45px;
-                }
-            }
-        </style>
-    </head>
-
-    <body>
-
-        <div class="header">
-            <div class="logo">
-                🔥 RYU <span class="red">V2</span>
-            </div>
-
-            <div class="online">
-                ● ONLINE
-            </div>
-        </div>
-
-        <div class="nav">
-            <div class="active">Signals</div>
-            <div>Trades</div>
-            <div>Performance</div>
-            <div>Settings</div>
-        </div>
-
-        <div class="container">
-
-            <div class="card">
-
-                <div class="ryu">🥋🔥</div>
-
-                <div class="signal">
-                    WAIT
-                </div>
-
-                <div class="confidence">
-                    Confidence: Waiting for live data
-                </div>
-
-                <div class="expiry">
-                    Expiry: <b>5 MINUTES</b>
-                </div>
-
-            </div>
-
-            <div class="grid">
-
-                <div class="box">
-                    <div class="label">MARKET</div>
-                    <div class="value">OTC</div>
-                </div>
-
-                <div class="box">
-                    <div class="label">TIMEFRAME</div>
-                    <div class="value">1M</div>
-                </div>
-
-                <div class="box">
-                    <div class="label">SIGNALS</div>
-                    <div class="value">0</div>
-                </div>
-
-                <div class="box">
-                    <div class="label">WIN RATE</div>
-                    <div class="value">--</div>
-                </div>
-
-            </div>
-
-            <div class="section">
-
-                <h2>Ryu Confluence</h2>
-
-                <div class="item">
-                    <span>Alligator</span>
-                    <span class="green">READY</span>
-                </div>
-
-                <div class="item">
-                    <span>Moving Average</span>
-                    <span class="green">READY</span>
-                </div>
-
-                <div class="item">
-                    <span>MACD</span>
-                    <span class="green">READY</span>
-                </div>
-
-                <div class="item">
-                    <span>RSI</span>
-                    <span class="green">READY</span>
-                </div>
-
-                <div class="item">
-                    <span>Bollinger Bands</span>
-                    <span class="green">READY</span>
-                </div>
-
-            </div>
-
-            <div class="section">
-
-                <h2>Live Market Feed</h2>
-
-                <p>
-                    Ryu V2 is online and waiting for market data.
-                </p>
-
-                <p>
-                    Status:
-                    <span class="green">
-                        CONNECTOR READY
-                    </span>
-                </p>
-
-            </div>
-
-        </div>
-
-        <div class="footer">
-            Ryu V2 • Signal Only • No automatic trade execution
-        </div>
-
-    </body>
-    </html>
-    """
-
-
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "ok",
-        "service": "Ryu V2",
-        "time": int(time.time())
-    })
-
-
-@app.route("/api/status")
-def status():
-    return jsonify({
-        "ok": True,
-        "bot": "Ryu V2",
-        "status": "ONLINE",
-        "expiry": "5 minutes",
-        "signals": 0,
-        "message": "Waiting for live market feed"
-    })
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
